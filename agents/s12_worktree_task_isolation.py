@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # Harness: directory isolation -- parallel execution lanes that never collide.
+# 机制：目录隔离 —— 永不冲突的并行执行通道
 """
-s12_worktree_task_isolation.py - Worktree + Task Isolation
+s12_worktree_task_isolation.py - Worktree + Task Isolation / 工作树 + 任务隔离
 
 Directory-level isolation for parallel task execution.
 Tasks are the control plane and worktrees are the execution plane.
+（目录级别的隔离用于并行任务执行。
+  任务是控制平面，工作树是执行平面。）
 
     .tasks/task_12.json
       {
@@ -28,6 +31,7 @@ Tasks are the control plane and worktrees are the execution plane.
       }
 
 Key insight: "Isolate by directory, coordinate by task ID."
+核心洞察：「按目录隔离，按任务 ID 协调。」
 """
 
 import json
@@ -51,7 +55,8 @@ MODEL = os.environ["MODEL_ID"]
 
 
 def detect_repo_root(cwd: Path) -> Path | None:
-    """Return git repo root if cwd is inside a repo, else None."""
+    """Return git repo root if cwd is inside a repo, else None.
+    检测当前目录是否在 git 仓库内，返回仓库根目录。"""
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -68,6 +73,7 @@ def detect_repo_root(cwd: Path) -> Path | None:
         return None
 
 
+# 仓库根目录：若当前在 git 仓库内则使用仓库根，否则使用当前目录
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 
 SYSTEM = (
@@ -80,6 +86,7 @@ SYSTEM = (
 
 
 # -- EventBus: append-only lifecycle events for observability --
+# -- EventBus：仅追加的生命周期事件总线，用于可观测性 --
 class EventBus:
     def __init__(self, event_log_path: Path):
         self.path = event_log_path
@@ -94,6 +101,7 @@ class EventBus:
         worktree: dict | None = None,
         error: str | None = None,
     ):
+        """发射生命周期事件，追加到 JSONL 事件日志"""
         payload = {
             "event": event,
             "ts": time.time(),
@@ -106,6 +114,7 @@ class EventBus:
             f.write(json.dumps(payload) + "\n")
 
     def list_recent(self, limit: int = 20) -> str:
+        """列出最近的 N 条事件"""
         n = max(1, min(int(limit or 20), 200))
         lines = self.path.read_text(encoding="utf-8").splitlines()
         recent = lines[-n:]
@@ -119,6 +128,7 @@ class EventBus:
 
 
 # -- TaskManager: persistent task board with optional worktree binding --
+# -- TaskManager：持久化任务板，可选绑定工作树 --
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
@@ -126,6 +136,7 @@ class TaskManager:
         self._next_id = self._max_id() + 1
 
     def _max_id(self) -> int:
+        """获取当前最大任务 ID"""
         ids = []
         for f in self.dir.glob("task_*.json"):
             try:
@@ -135,18 +146,22 @@ class TaskManager:
         return max(ids) if ids else 0
 
     def _path(self, task_id: int) -> Path:
+        """任务文件路径"""
         return self.dir / f"task_{task_id}.json"
 
     def _load(self, task_id: int) -> dict:
+        """从文件加载任务"""
         path = self._path(task_id)
         if not path.exists():
             raise ValueError(f"Task {task_id} not found")
         return json.loads(path.read_text())
 
     def _save(self, task: dict):
+        """持久化任务到文件"""
         self._path(task["id"]).write_text(json.dumps(task, indent=2))
 
     def create(self, subject: str, description: str = "") -> str:
+        """创建新任务"""
         task = {
             "id": self._next_id,
             "subject": subject,
@@ -163,12 +178,15 @@ class TaskManager:
         return json.dumps(task, indent=2)
 
     def get(self, task_id: int) -> str:
+        """获取任务详情"""
         return json.dumps(self._load(task_id), indent=2)
 
     def exists(self, task_id: int) -> bool:
+        """检查任务是否存在"""
         return self._path(task_id).exists()
 
     def update(self, task_id: int, status: str = None, owner: str = None) -> str:
+        """更新任务状态或所有者"""
         task = self._load(task_id)
         if status:
             if status not in ("pending", "in_progress", "completed"):
@@ -181,6 +199,7 @@ class TaskManager:
         return json.dumps(task, indent=2)
 
     def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+        """将任务绑定到工作树。若任务为 pending 则自动切换到 in_progress。"""
         task = self._load(task_id)
         task["worktree"] = worktree
         if owner:
@@ -192,6 +211,7 @@ class TaskManager:
         return json.dumps(task, indent=2)
 
     def unbind_worktree(self, task_id: int) -> str:
+        """解绑任务与工作树的关联"""
         task = self._load(task_id)
         task["worktree"] = ""
         task["updated_at"] = time.time()
@@ -199,6 +219,8 @@ class TaskManager:
         return json.dumps(task, indent=2)
 
     def list_all(self) -> str:
+        """列出所有任务及其状态摘要
+        [ ] = pending 待处理, [>] = in_progress 进行中, [x] = completed 已完成"""
         tasks = []
         for f in sorted(self.dir.glob("task_*.json")):
             tasks.append(json.loads(f.read_text()))
@@ -217,11 +239,14 @@ class TaskManager:
         return "\n".join(lines)
 
 
+# 任务管理器实例（位于仓库根目录的 .tasks/ 下）
 TASKS = TaskManager(REPO_ROOT / ".tasks")
+# 事件总线实例（位于 .worktrees/events.jsonl）
 EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
 
 
 # -- WorktreeManager: create/list/run/remove git worktrees + lifecycle index --
+# -- WorktreeManager：创建/列出/运行/移除 git 工作树 + 生命周期索引 --
 class WorktreeManager:
     def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
         self.repo_root = repo_root
@@ -235,6 +260,7 @@ class WorktreeManager:
         self.git_available = self._is_git_repo()
 
     def _is_git_repo(self) -> bool:
+        """检查当前目录是否是 git 仓库"""
         try:
             r = subprocess.run(
                 ["git", "rev-parse", "--is-inside-work-tree"],
@@ -248,6 +274,7 @@ class WorktreeManager:
             return False
 
     def _run_git(self, args: list[str]) -> str:
+        """执行 git 命令（需要 git 仓库）"""
         if not self.git_available:
             raise RuntimeError("Not in a git repository. worktree tools require git.")
         r = subprocess.run(
@@ -263,12 +290,15 @@ class WorktreeManager:
         return (r.stdout + r.stderr).strip() or "(no output)"
 
     def _load_index(self) -> dict:
+        """加载工作树索引"""
         return json.loads(self.index_path.read_text())
 
     def _save_index(self, data: dict):
+        """持久化工作树索引"""
         self.index_path.write_text(json.dumps(data, indent=2))
 
     def _find(self, name: str) -> dict | None:
+        """按名称在工作树索引中查找"""
         idx = self._load_index()
         for wt in idx.get("worktrees", []):
             if wt.get("name") == name:
@@ -276,12 +306,21 @@ class WorktreeManager:
         return None
 
     def _validate_name(self, name: str):
+        """验证工作树名称：1-40 个字符，仅允许字母、数字、点、下划线、横线"""
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name or ""):
             raise ValueError(
                 "Invalid worktree name. Use 1-40 chars: letters, numbers, ., _, -"
             )
 
     def create(self, name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
+        """
+        创建 git 工作树。
+        - 验证名称合法性
+        - 创建分支 wt/{name}
+        - 在 .worktrees/{name} 路径创建物理工作树
+        - 更新索引并绑定任务
+        - 发射生命周期事件
+        """
         self._validate_name(name)
         if self._find(name):
             raise ValueError(f"Worktree '{name}' already exists in index")
@@ -335,6 +374,7 @@ class WorktreeManager:
             raise
 
     def list_all(self) -> str:
+        """列出索引中记录的所有工作树"""
         idx = self._load_index()
         wts = idx.get("worktrees", [])
         if not wts:
@@ -349,6 +389,7 @@ class WorktreeManager:
         return "\n".join(lines)
 
     def status(self, name: str) -> str:
+        """查看指定工作树的 git status"""
         wt = self._find(name)
         if not wt:
             return f"Error: Unknown worktree '{name}'"
@@ -366,6 +407,7 @@ class WorktreeManager:
         return text or "Clean worktree"
 
     def run(self, name: str, command: str) -> str:
+        """在指定工作树目录中执行 shell 命令"""
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
             return "Error: Dangerous command blocked"
@@ -392,6 +434,12 @@ class WorktreeManager:
             return "Error: Timeout (300s)"
 
     def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
+        """
+        移除工作树。
+        - 可选：标记关联任务为 completed
+        - 更新索引状态为 removed
+        - 发射生命周期事件
+        """
         wt = self._find(name)
         if not wt:
             return f"Error: Unknown worktree '{name}'"
@@ -446,6 +494,10 @@ class WorktreeManager:
             raise
 
     def keep(self, name: str) -> str:
+        """
+        标记工作树为 kept（保留），不执行物理删除。
+        用于关闭阶段：确认工作树成果需要保留。
+        """
         wt = self._find(name)
         if not wt:
             return f"Error: Unknown worktree '{name}'"
@@ -471,11 +523,14 @@ class WorktreeManager:
         return json.dumps(kept, indent=2) if kept else f"Error: Unknown worktree '{name}'"
 
 
+# 工作树管理器实例
 WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
 
 
 # -- Base tools (kept minimal, same style as previous sessions) --
+# -- 基础工具（保持极简，与前面章节风格一致）--
 def safe_path(p: str) -> Path:
+    """将相对路径解析为工作目录下的绝对路径，并检查路径逃逸"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -483,6 +538,7 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str) -> str:
+    """执行 shell 命令，阻止危险命令，超时 120 秒"""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -502,6 +558,7 @@ def run_bash(command: str) -> str:
 
 
 def run_read(path: str, limit: int = None) -> str:
+    """读取文件内容，可选限制行数"""
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -512,6 +569,7 @@ def run_read(path: str, limit: int = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """写入文件内容，自动创建父目录"""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -522,6 +580,7 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """替换文件中的精确文本（仅替换第一次出现）"""
     try:
         fp = safe_path(path)
         c = fp.read_text()
@@ -533,6 +592,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# 工具处理器映射：4 个基础工具 + 4 个任务工具 + 6 个工作树工具 + 1 个事件工具 = 15 个工具
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -727,6 +787,7 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """代理主循环：调用 LLM → 执行工具（含任务 + 工作树）→ 返回结果 → 循环"""
     while True:
         response = client.messages.create(
             model=MODEL,

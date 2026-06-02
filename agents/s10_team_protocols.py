@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # Harness: protocols -- structured handshakes between models.
+# 机制：协议 —— 模型之间的结构化握手
 """
-s10_team_protocols.py - Team Protocols
+s10_team_protocols.py - Team Protocols / 团队协议
 
 Shutdown protocol and plan approval protocol, both using the same
 request_id correlation pattern. Builds on s09's team messaging.
+（关闭协议和计划审批协议，两者使用相同的 request_id 关联模式。基于 s09 的团队消息构建。）
 
     Shutdown FSM: pending -> approved | rejected
+    关闭状态机：pending → approved（已批准） | rejected（已拒绝）
 
     Lead                              Teammate
     +---------------------+          +---------------------+
     | shutdown_request     |          |                     |
     | {                    | -------> | receives request    |
     |   request_id: abc    |          | decides: approve?   |
-    | }                    |          |                     |
+    | }                    |          | 决定是否批准         |
     +---------------------+          +---------------------+
                                              |
     +---------------------+          +-------v-------------+
@@ -25,9 +28,10 @@ request_id correlation pattern. Builds on s09's team messaging.
     +---------------------+          +---------------------+
             |
             v
-    status -> "shutdown", thread stops
+    status -> "shutdown", thread stops  / 状态 → "shutdown"，线程停止
 
     Plan approval FSM: pending -> approved | rejected
+    计划审批状态机：pending → approved | rejected
 
     Teammate                          Lead
     +---------------------+          +---------------------+
@@ -43,8 +47,10 @@ request_id correlation pattern. Builds on s09's team messaging.
                                      +---------------------+
 
     Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
+    追踪器：按 request_id 关联请求和响应
 
 Key insight: "Same request_id correlation pattern, two domains."
+核心洞察：「相同的 request_id 关联模式，覆盖两个不同领域。」
 """
 
 import json
@@ -70,6 +76,7 @@ INBOX_DIR = TEAM_DIR / "inbox"
 
 SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
 
+# 有效消息类型
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -79,12 +86,14 @@ VALID_MSG_TYPES = {
 }
 
 # -- Request trackers: correlate by request_id --
-shutdown_requests = {}
-plan_requests = {}
+# -- 请求追踪器：按 request_id 关联请求和响应 --
+shutdown_requests = {}  # 关闭请求追踪
+plan_requests = {}       # 计划审批请求追踪
 _tracker_lock = threading.Lock()
 
 
 # -- MessageBus: JSONL inbox per teammate --
+# -- MessageBus：每个队友一个 JSONL 收件箱 --
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -92,6 +101,7 @@ class MessageBus:
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        """发送消息：将 JSON 行追加到接收者的收件箱文件中"""
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
         msg = {
@@ -108,6 +118,7 @@ class MessageBus:
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
+        """读取并清空收件箱（drain 语义）"""
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
@@ -119,6 +130,7 @@ class MessageBus:
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        """向所有队友广播消息"""
         count = 0
         for name in teammates:
             if name != sender:
@@ -131,6 +143,7 @@ BUS = MessageBus(INBOX_DIR)
 
 
 # -- TeammateManager with shutdown + plan approval --
+# -- TeammateManager：支持关闭协议和计划审批协议 --
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -140,20 +153,24 @@ class TeammateManager:
         self.threads = {}
 
     def _load_config(self) -> dict:
+        """加载团队配置"""
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
+        """持久化团队配置"""
         self.config_path.write_text(json.dumps(self.config, indent=2))
 
     def _find_member(self, name: str) -> dict:
+        """按名称查找团队成员"""
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        """派生新的团队成员线程"""
         member = self._find_member(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
@@ -174,6 +191,12 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        """
+        队友的 agent loop（在独立线程中运行）。
+        支持：
+        - 关闭协议：收到 shutdown_request → 调用 shutdown_response 批准/拒绝
+        - 计划审批：调用 plan_approval 提交计划，等待 lead 审批
+        """
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
@@ -211,6 +234,7 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # 如果队友批准了关闭请求，退出循环
                     if block.name == "shutdown_response" and block.input.get("approve"):
                         should_exit = True
             messages.append({"role": "user", "content": results})
@@ -220,6 +244,7 @@ class TeammateManager:
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
+        """队友的工具执行分发器：基础工具 + 通信 + 关闭/计划协议"""
         # these base tools are unchanged from s02
         if tool_name == "bash":
             return _run_bash(args["command"])
@@ -234,6 +259,7 @@ class TeammateManager:
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
         if tool_name == "shutdown_response":
+            # 队友响应关闭请求：更新追踪器状态，通知 lead
             req_id = args["request_id"]
             approve = args["approve"]
             with _tracker_lock:
@@ -245,6 +271,7 @@ class TeammateManager:
             )
             return f"Shutdown {'approved' if approve else 'rejected'}"
         if tool_name == "plan_approval":
+            # 队友提交计划审批：创建追踪记录，通知 lead
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
             with _tracker_lock:
@@ -257,6 +284,7 @@ class TeammateManager:
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
+        """队友可用的工具列表：基础工具 + 通信工具 + 关闭响应 + 计划审批提交"""
         # these base tools are unchanged from s02
         return [
             {"name": "bash", "description": "Run a shell command.",
@@ -278,6 +306,7 @@ class TeammateManager:
         ]
 
     def list_all(self) -> str:
+        """列出所有团队成员及其状态"""
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -286,6 +315,7 @@ class TeammateManager:
         return "\n".join(lines)
 
     def member_names(self) -> list:
+        """获取所有成员名称列表"""
         return [m["name"] for m in self.config["members"]]
 
 
@@ -293,7 +323,9 @@ TEAM = TeammateManager(TEAM_DIR)
 
 
 # -- Base tool implementations (these base tools are unchanged from s02) --
+# -- 基础工具实现（与 s02 相同）--
 def _safe_path(p: str) -> Path:
+    """将相对路径解析为工作目录下的绝对路径，并检查路径逃逸"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -301,6 +333,7 @@ def _safe_path(p: str) -> Path:
 
 
 def _run_bash(command: str) -> str:
+    """执行 shell 命令，阻止危险命令，超时 120 秒"""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -316,6 +349,7 @@ def _run_bash(command: str) -> str:
 
 
 def _run_read(path: str, limit: int = None) -> str:
+    """读取文件内容，可选限制行数"""
     try:
         lines = _safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -326,6 +360,7 @@ def _run_read(path: str, limit: int = None) -> str:
 
 
 def _run_write(path: str, content: str) -> str:
+    """写入文件内容，自动创建父目录"""
     try:
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +371,7 @@ def _run_write(path: str, content: str) -> str:
 
 
 def _run_edit(path: str, old_text: str, new_text: str) -> str:
+    """替换文件中的精确文本（仅替换第一次出现）"""
     try:
         fp = _safe_path(path)
         c = fp.read_text()
@@ -348,7 +384,10 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # -- Lead-specific protocol handlers --
+# -- Lead 专用的协议处理器 --
+
 def handle_shutdown_request(teammate: str) -> str:
+    """Lead 向指定队友发起关闭请求。生成 request_id 并放入追踪器。"""
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
@@ -360,6 +399,7 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """Lead 审批队友的计划。批准或拒绝，并将结果通知队友。"""
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
@@ -374,11 +414,13 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 
 def _check_shutdown_status(request_id: str) -> str:
+    """查询指定关闭请求的当前状态"""
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
 # -- Lead tool dispatch (12 tools) --
+# -- Lead 工具分发（12 个工具）--
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -424,6 +466,7 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Lead 的 agent loop：轮询收件箱 → 调用 LLM → 执行工具（含协议处理）→ 循环"""
     while True:
         inbox = BUS.read_inbox("lead")
         if inbox:
