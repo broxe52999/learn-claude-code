@@ -711,7 +711,7 @@
         {
           "name": "safe_path",
           "signature": "def safe_path(p: str)",
-          "startLine": 124
+          "startLine": 131
         },
         {
           "name": "run_bash",

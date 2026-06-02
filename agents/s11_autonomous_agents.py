@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # Harness: autonomy -- models that find work without being told.
+# 机制：自主性 —— 无需被告知就能自己找到工作的模型
 """
-s11_autonomous_agents.py - Autonomous Agents
+s11_autonomous_agents.py - Autonomous Agents / 自主代理
 
 Idle cycle with task board polling, auto-claiming unclaimed tasks, and
 identity re-injection after context compression. Builds on s10's protocols.
+（空闲循环与任务板轮询、自动认领未分配任务、以及上下文压缩后的身份重新注入。
+  基于 s10 的协议构建。）
 
-    Teammate lifecycle:
+    Teammate lifecycle:  /  队友生命周期：
     +-------+
-    | spawn |
+    | spawn |  /  派生
     +---+---+
         |
         v
@@ -16,23 +19,24 @@ identity re-injection after context compression. Builds on s10's protocols.
     | WORK  | <----------- |  LLM  |
     +---+---+              +-------+
         |
-        | stop_reason != tool_use
+        | stop_reason != tool_use  /  模型停止调用工具
         v
     +--------+
-    | IDLE   | poll every 5s for up to 60s
+    | IDLE   | poll every 5s for up to 60s  /  空闲：每5秒轮询，最多60秒
     +---+----+
         |
-        +---> check inbox -> message? -> resume WORK
+        +---> check inbox -> message? -> resume WORK   /  检查收件箱 → 有消息 → 恢复工作
         |
-        +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
+        +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK  /  扫描任务板 → 未认领 → 认领 → 恢复工作
         |
-        +---> timeout (60s) -> shutdown
+        +---> timeout (60s) -> shutdown  /  超时 → 关闭
 
-    Identity re-injection after compression:
+    Identity re-injection after compression:  /  压缩后身份重新注入：
     messages = [identity_block, ...remaining...]
     "You are 'coder', role: backend, team: my-team"
 
 Key insight: "The agent finds work itself."
+核心洞察：「代理自己寻找工作。」
 """
 
 import json
@@ -57,11 +61,13 @@ TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
 
+# 空闲轮询间隔（秒）和超时（秒）
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
 
+# 有效消息类型
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -71,13 +77,15 @@ VALID_MSG_TYPES = {
 }
 
 # -- Request trackers --
+# -- 请求追踪器 --
 shutdown_requests = {}
 plan_requests = {}
 _tracker_lock = threading.Lock()
-_claim_lock = threading.Lock()
+_claim_lock = threading.Lock()  # 任务认领互斥锁
 
 
 # -- MessageBus: JSONL inbox per teammate --
+# -- MessageBus：每个队友一个 JSONL 收件箱 --
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -85,6 +93,7 @@ class MessageBus:
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        """发送消息：将 JSON 行追加到接收者的收件箱文件中"""
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
         msg = {
@@ -101,6 +110,7 @@ class MessageBus:
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
+        """读取并清空收件箱（drain 语义）"""
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
@@ -112,6 +122,7 @@ class MessageBus:
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        """向所有队友广播消息"""
         count = 0
         for name in teammates:
             if name != sender:
@@ -124,7 +135,9 @@ BUS = MessageBus(INBOX_DIR)
 
 
 # -- Task board scanning --
+# -- 任务板扫描 --、
 def scan_unclaimed_tasks() -> list:
+    """扫描 .tasks/ 目录，返回所有未被认领且无阻塞依赖的 pending 任务"""
     TASKS_DIR.mkdir(exist_ok=True)
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
@@ -137,6 +150,10 @@ def scan_unclaimed_tasks() -> list:
 
 
 def claim_task(task_id: int, owner: str) -> str:
+    """
+    认领任务：线程安全地将任务标记为 in_progress 并设置 owner。
+    检查：任务存在、未被他人认领、状态为 pending、无阻塞依赖。
+    """
     with _claim_lock:
         path = TASKS_DIR / f"task_{task_id}.json"
         if not path.exists():
@@ -157,7 +174,12 @@ def claim_task(task_id: int, owner: str) -> str:
 
 
 # -- Identity re-injection after compression --
+# -- 压缩后身份重新注入 --
 def make_identity_block(name: str, role: str, team_name: str) -> dict:
+    """
+    生成身份标识块。当消息列表被压缩后，将此块插回消息开头，
+    确保代理始终知道自己的身份。
+    """
     return {
         "role": "user",
         "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
@@ -165,6 +187,7 @@ def make_identity_block(name: str, role: str, team_name: str) -> dict:
 
 
 # -- Autonomous TeammateManager --
+# -- 自主 TeammateManager --
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -174,26 +197,31 @@ class TeammateManager:
         self.threads = {}
 
     def _load_config(self) -> dict:
+        """加载团队配置"""
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
+        """持久化团队配置"""
         self.config_path.write_text(json.dumps(self.config, indent=2))
 
     def _find_member(self, name: str) -> dict:
+        """按名称查找团队成员"""
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
 
     def _set_status(self, name: str, status: str):
+        """更新团队成员状态并持久化"""
         member = self._find_member(name)
         if member:
             member["status"] = status
             self._save_config()
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        """派生自主队友：拥有 WORK → IDLE → WORK 生命周期循环"""
         member = self._find_member(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
@@ -214,6 +242,14 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _loop(self, name: str, role: str, prompt: str):
+        """
+        自主队友的生命周期循环：
+        1. WORK 阶段：正常的 agent loop（最多 50 轮工具调用）
+        2. IDLE 阶段：轮询收件箱和任务板
+           - 有新消息 → 恢复 WORK
+           - 有未认领任务 → 自动认领 → 恢复 WORK
+           - 超时（60s）→ shutdown
+        """
         team_name = self.config["team_name"]
         sys_prompt = (
             f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
@@ -224,6 +260,7 @@ class TeammateManager:
 
         while True:
             # -- WORK PHASE: standard agent loop --
+            # -- 工作阶段：标准 agent loop --
             for _ in range(50):
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
@@ -250,6 +287,7 @@ class TeammateManager:
                 for block in response.content:
                     if block.type == "tool_use":
                         if block.name == "idle":
+                            # 模型主动请求进入空闲状态
                             idle_requested = True
                             output = "Entering idle phase. Will poll for new tasks."
                         else:
@@ -265,11 +303,13 @@ class TeammateManager:
                     break
 
             # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
+            # -- 空闲阶段：轮询收件箱消息和未认领任务 --
             self._set_status(name, "idle")
             resume = False
             polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
             for _ in range(polls):
                 time.sleep(POLL_INTERVAL)
+                # 检查收件箱
                 inbox = BUS.read_inbox(name)
                 if inbox:
                     for msg in inbox:
@@ -279,6 +319,7 @@ class TeammateManager:
                         messages.append({"role": "user", "content": json.dumps(msg)})
                     resume = True
                     break
+                # 扫描未认领任务
                 unclaimed = scan_unclaimed_tasks()
                 if unclaimed:
                     task = unclaimed[0]
@@ -289,6 +330,7 @@ class TeammateManager:
                         f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
                         f"{task.get('description', '')}</auto-claimed>"
                     )
+                    # 身份重新注入：如果消息列表很短（可能被压缩过），插入身份块
                     if len(messages) <= 3:
                         messages.insert(0, make_identity_block(name, role, team_name))
                         messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
@@ -298,11 +340,14 @@ class TeammateManager:
                     break
 
             if not resume:
+                # 空闲超时，优雅关闭
                 self._set_status(name, "shutdown")
                 return
+            # 恢复工作
             self._set_status(name, "working")
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
+        """队友的工具执行分发器：基础工具 + 通信 + 协议 + 自主功能"""
         # these base tools are unchanged from s02
         if tool_name == "bash":
             return _run_bash(args["command"])
@@ -341,6 +386,7 @@ class TeammateManager:
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
+        """队友可用的工具列表：基础 + 通信 + 协议 + idle + claim_task"""
         # these base tools are unchanged from s02
         return [
             {"name": "bash", "description": "Run a shell command.",
@@ -366,6 +412,7 @@ class TeammateManager:
         ]
 
     def list_all(self) -> str:
+        """列出所有团队成员及其状态"""
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -374,6 +421,7 @@ class TeammateManager:
         return "\n".join(lines)
 
     def member_names(self) -> list:
+        """获取所有成员名称列表"""
         return [m["name"] for m in self.config["members"]]
 
 
@@ -381,7 +429,9 @@ TEAM = TeammateManager(TEAM_DIR)
 
 
 # -- Base tool implementations (these base tools are unchanged from s02) --
+# -- 基础工具实现（与 s02 相同）--
 def _safe_path(p: str) -> Path:
+    """将相对路径解析为工作目录下的绝对路径，并检查路径逃逸"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -389,6 +439,7 @@ def _safe_path(p: str) -> Path:
 
 
 def _run_bash(command: str) -> str:
+    """执行 shell 命令，阻止危险命令，超时 120 秒"""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -404,6 +455,7 @@ def _run_bash(command: str) -> str:
 
 
 def _run_read(path: str, limit: int = None) -> str:
+    """读取文件内容，可选限制行数"""
     try:
         lines = _safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -414,6 +466,7 @@ def _run_read(path: str, limit: int = None) -> str:
 
 
 def _run_write(path: str, content: str) -> str:
+    """写入文件内容，自动创建父目录"""
     try:
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -424,6 +477,7 @@ def _run_write(path: str, content: str) -> str:
 
 
 def _run_edit(path: str, old_text: str, new_text: str) -> str:
+    """替换文件中的精确文本（仅替换第一次出现）"""
     try:
         fp = _safe_path(path)
         c = fp.read_text()
@@ -436,7 +490,9 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # -- Lead-specific protocol handlers --
+# -- Lead 专用协议处理器 --
 def handle_shutdown_request(teammate: str) -> str:
+    """Lead 向队友发起关闭请求"""
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
@@ -448,6 +504,7 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """Lead 审批队友的计划"""
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
@@ -462,11 +519,13 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 
 def _check_shutdown_status(request_id: str) -> str:
+    """查询关闭请求状态"""
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
 # -- Lead tool dispatch (14 tools) --
+# -- Lead 工具分发（14 个工具）--
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -518,6 +577,7 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Lead 的 agent loop：轮询收件箱 → 调用 LLM → 执行工具 → 循环"""
     while True:
         inbox = BUS.read_inbox("lead")
         if inbox:
@@ -569,6 +629,7 @@ if __name__ == "__main__":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
         if query.strip() == "/tasks":
+            # 快速查看任务板
             TASKS_DIR.mkdir(exist_ok=True)
             for f in sorted(TASKS_DIR.glob("task_*.json")):
                 t = json.loads(f.read_text())

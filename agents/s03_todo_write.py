@@ -27,6 +27,13 @@ forces it to keep updating when it forgets.
 Key insight: "The agent can track its own progress -- and I can see it."
 """
 
+# 多步任务中, 模型会丢失进度 -- 重复做过的事、跳步、跑偏。
+# 对话越长越严重: 工具结果不断填满上下文, 系统提示的影响力逐渐被稀释。
+# 一个 10 步重构可能做完 1-3 步就开始即兴发挥, 因为 4-10 步已经被挤出注意力了。
+
+
+#"同时只能有一个 in_progress" 强制顺序聚焦。nag reminder 制造问责压力 -- 你不更新计划, 系统就追着你问。
+
 import os
 import subprocess
 from pathlib import Path
@@ -160,6 +167,27 @@ TOOLS = [
 ]
 
 
+# 完整调用示例：
+#   {
+#     "items": [
+#       {
+#         "id": "1",
+#         "text": "Read the target files",
+#         "status": "completed"
+#       },
+#       {
+#         "id": "2",
+#         "text": "Implement the change",
+#         "status": "in_progress"
+#       },
+#       {
+#         "id": "3",
+#         "text": "Run focused tests",
+#         "status": "pending"
+#       }
+#     ]
+#   }
+
 # -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
     rounds_since_todo = 0
@@ -186,6 +214,7 @@ def agent_loop(messages: list):
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "todo":
                     used_todo = True
+        # 如果连续 3 轮工具调用都没有用todo工具，就注入 <reminder>Update your todos.</reminder> 提醒模型更新计划。                    
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})

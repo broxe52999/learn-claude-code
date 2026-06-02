@@ -37,7 +37,7 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
-
+# safe_path 的作用是把用户传入的相对路径变成安全的绝对路径，并禁止访问工作区外的文件。
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -94,6 +94,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 # -- The dispatch map: {tool_name: handler} --
 TOOL_HANDLERS = {
+    #   lambda **kw: 的意思是：定义一个匿名函数，并且接收任意关键字参数，把它们收集成一个字典 kw。
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
@@ -125,6 +126,7 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
+                # **block.input 是“把字典展开成函数的关键字参数”。
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 print(f"> {block.name}:")
                 print(output[:200])
