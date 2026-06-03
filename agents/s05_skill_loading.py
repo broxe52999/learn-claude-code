@@ -244,3 +244,15 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+
+
+
+
+
+"""
+    1. 系统提示词内仅少量 token 存放技能的名称和描述，当模型需要时，通过 调用 load_skill 工具 返回完整技能内容
+    2. tool_use 返回 type name input
+    3. 如果skill只是提示词，那就是把skill加到了message，让模型自己理解
+    4. 如果skill有别的内容，不仅仅是skill.md呢？
+
+"""

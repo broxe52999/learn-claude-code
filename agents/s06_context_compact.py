@@ -65,6 +65,14 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
+# 压缩思想：
+# 1. 把上下文窗口当成有限缓存，只把“继续当前任务必需的信息”留在内存里。
+# 2. 每轮先做轻量微压缩：旧工具结果通常只证明“用过某工具”，可替换为占位符；
+#    最近几条结果保留原文，保证模型还能接上当前操作。
+# 3. 文件读取结果属于高价值参考材料，默认不压缩，避免模型为了找回源码上下文反复读文件。
+# 4. 当 token 超过阈值或模型主动调用 compact 时，先把完整记录落盘，再用摘要替换对话历史；
+#    这样既能释放上下文窗口，又保留可追溯的 transcript 和继续推进任务所需的关键状态。
+
 # 当 token 估算值超过此阈值时触发自动压缩
 THRESHOLD = 50000
 # 对话记录存档目录
@@ -300,3 +308,7 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+
+
+# 需要看一下这个工具结果压缩后是什么样子
+# 我看到了，就是把tool_result替换成那个了 使用了什么命令 ，比如“[Previous: used bash]”
