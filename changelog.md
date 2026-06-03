@@ -6,3 +6,9 @@ feat: s01 支持流式输出和响应中断, AI=100%
 1. `agents/s01_agent_loop.py` 新增 `stream_llm` 和 `InterruptController`，改用 `client.messages.stream` 边接收边输出模型响应
 2. 模型响应期间支持通过 `Esc` 或 `Ctrl+C` 取消当前输出，并写入 `[Interrupted by user]` 占位，避免半截响应进入后续历史
 3. 更新 `web/src/data/generated/docs.json` 和 `web/src/data/generated/versions.json`，同步文档站点的源码快照与 LOC 统计
+
+docs: 补充上下文压缩设计注释, AI=100%
+1. `agents/s06_context_compact.py` 补充压缩思想注释，说明有限上下文缓存、微压缩、文件读取保留和摘要压缩的设计取舍
+
+docs: 补充任务系统设计架构注释, AI=100%
+1. `agents/s07_task_system.py` 新增中文注释，整理任务持久化、依赖解除、工具暴露和代理主循环的设计思想

@@ -48,22 +48,32 @@ TASKS_DIR = WORKDIR / ".tasks"
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
 
+# 设计思想：
+# 任务系统把“长期目标状态”从对话历史中拆出来，写入工作区的 .tasks/ 文件。
+# 对话可以被压缩、截断或重新开始，但任务文件仍然保留目标、状态和依赖关系。
+# 模型不直接管理内存对象，而是通过工具读写任务文件，让状态变化变成可审计的外部事实。
+# 阻塞依赖字段表示任务之间的前置关系，任务完成后自动解除其他任务对它的阻塞。
+# 这样代理既能在单轮对话里执行工具，也能围绕跨轮任务持续推进。
+
 
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
 # -- TaskManager：带依赖图的 CRUD 操作，以 JSON 文件持久化 --
 class TaskManager:
     def __init__(self, tasks_dir: Path):
+        # 启动时只根据磁盘已有任务计算下一个 ID，不依赖当前对话是否记得历史任务。
         self.dir = tasks_dir
         self.dir.mkdir(exist_ok=True)
         self._next_id = self._max_id() + 1
 
     def _max_id(self) -> int:
         """获取当前最大任务 ID"""
+        # 文件名承担轻量索引角色，任务文件名里的数字就是任务编号。
         ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
         return max(ids) if ids else 0
 
     def _load(self, task_id: int) -> dict:
         """从文件加载指定任务"""
+        # 每次按需读取最新文件，避免进程内缓存和磁盘状态不一致。
         path = self.dir / f"task_{task_id}.json"
         if not path.exists():
             raise ValueError(f"Task {task_id} not found")
@@ -71,11 +81,13 @@ class TaskManager:
 
     def _save(self, task: dict):
         """将任务保存到文件"""
+        # 结构化任务文件既是持久化层，也是人类可直接检查和修正的任务记录。
         path = self.dir / f"task_{task['id']}.json"
         path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
 
     def create(self, subject: str, description: str = "") -> str:
         """创建新任务，初始状态为 pending，无依赖"""
+        # 任务模型保持很小：主题、描述、状态、阻塞依赖和负责人，避免引入复杂调度器。
         task = {
             "id": self._next_id, "subject": subject, "description": description,
             "status": "pending", "blockedBy": [], "owner": "",
@@ -94,6 +106,7 @@ class TaskManager:
         - 可设置 status（pending / in_progress / completed）
         - 可添加或移除 blockedBy 依赖
         - 完成任务时自动清除其他任务中对它的依赖"""
+        # 更新方法是任务状态机的唯一入口，状态变化和依赖变化都从这里收敛。
         task = self._load(task_id)
         if status:
             if status not in ("pending", "in_progress", "completed"):
@@ -112,6 +125,7 @@ class TaskManager:
     def _clear_dependency(self, completed_id: int):
         """Remove completed_id from all other tasks' blockedBy lists.
         将已完成的任务 ID 从所有其他任务的 blockedBy 列表中移除。"""
+        # 依赖解除采用全量扫描，换取实现简单；任务量小的演示系统不需要额外索引。
         for f in self.dir.glob("task_*.json"):
             task = json.loads(f.read_text())
             if completed_id in task.get("blockedBy", []):
@@ -142,6 +156,8 @@ TASKS = TaskManager(TASKS_DIR)
 
 
 # -- Base tool implementations / 基础工具实现 --
+# 基础工具负责让代理读写文件和执行命令，任务工具负责让代理维护长期目标。
+# 两类工具共用同一个工具调用循环，因此任务管理不是独立服务，而是代理能力的一部分。
 def safe_path(p: str) -> Path:
     """将相对路径解析为工作目录下的绝对路径，并检查路径逃逸"""
     path = (WORKDIR / p).resolve()
@@ -196,6 +212,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # 工具处理器映射：含 4 个基础工具 + 4 个任务工具
+# 处理器映射是工具名到本地函数的执行路由，模型只看到工具入参结构，不直接接触运行时对象。
 TOOL_HANDLERS = {
     "bash":        lambda **kw: run_bash(kw["command"]),
     "read_file":   lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -207,6 +224,8 @@ TOOL_HANDLERS = {
     "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
 }
 
+# 工具入参结构是暴露给模型的能力边界，决定模型能传什么参数、能做哪些动作。
+# 创建、更新、列表、详情四个任务工具组成最小任务协议。
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -229,17 +248,21 @@ TOOLS = [
 
 def agent_loop(messages: list):
     """代理主循环：调用 LLM → 执行工具（含任务 CRUD）→ 返回结果 → 循环"""
+    # 主循环的职责是把模型意图落到工具执行结果，再把结果回填给模型继续推理。
+    # 任务文件的持久化发生在工具执行阶段，所以即使后续对话历史变短，任务状态也不会丢失。
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+        # 没有工具调用时说明模型已经给出最终回复，本轮代理循环结束。
         if response.stop_reason != "tool_use":
             return
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # 每个工具调用独立捕获异常，避免单个失败直接中断整轮代理执行。
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
@@ -260,6 +283,7 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        # 当前进程保存对话上下文，长期任务状态则保存在任务目录中。
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
