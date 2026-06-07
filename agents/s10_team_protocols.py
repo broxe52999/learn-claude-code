@@ -525,3 +525,139 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+
+
+# ====================================================================
+# 总结 / Summary
+# ====================================================================
+#
+# 一、设计思想 / Design Philosophy
+# ────────────────────────────────────────────────────────────────────
+# 1. 协议驱动的 Agent 协作 (Protocol-Driven Agent Collaboration)
+#    将 Lead 与 Teammate 之间的交互抽象为「协议」——结构化的握手流程，
+#    每个协议都有明确的请求-响应语义和状态机。
+#
+# 2. 统一关联模式 (Unified Correlation Pattern)
+#    关闭协议和计划审批协议共享完全相同的 request_id 关联机制：
+#       生成 request_id → 放入追踪器(pending) → 发送请求 → 对方响应
+#       → 更新追踪器状态(approved/rejected) → 通知发起方
+#    这种「一处定义，多处复用」的模式是整篇代码的核心洞察。
+#
+# 3. 收件箱即总线 (Inbox-as-Bus)
+#    不依赖 HTTP、gRPC 等网络协议，而是用 JSONL 文件作为消息传递媒介。
+#    每个 agent 拥有一个独立的 inbox 文件，读取即清空 (drain 语义)。
+#    这使整个系统可以在单进程内零依赖运行，同时保留了向分布式
+#    演进的可能性（只需替换 MessageBus 的实现）。
+#
+# 4. 关注点分离 (Separation of Concerns)
+#    通信层 (MessageBus) / 生命周期层 (TeammateManager) / 协议层
+#    (shutdown/plan handlers) / 工具层 (TOOLS/TOOL_HANDLERS) 各司其职，
+#    互不侵入。
+#
+#
+# 二、设计架构 / Architecture
+# ────────────────────────────────────────────────────────────────────
+#
+#   ┌──────────────────────────────────────────────────────────┐
+#   │                      Lead Agent Loop                      │
+#   │  agent_loop() → read inbox → call LLM → dispatch TOOLS  │
+#   │                      ↑                    │               │
+#   │              TOOL_HANDLERS (12 tools)       │               │
+#   │                      ↑                    ↓               │
+#   │  ┌───────────────────┼────────────────────┼───────────┐  │
+#   │  │         MessageBus (JSONL inbox files)  │           │  │
+#   │  │   lead.jsonl ←→ alice.jsonl ←→ bob.jsonl            │  │
+#   │  └───────────────────┼────────────────────┼───────────┘  │
+#   │                      ↑                    │               │
+#   │              Teammate._exec()     Teammate._exec()       │
+#   │                      ↑                    ↑               │
+#   │              Teammate Loop         Teammate Loop          │
+#   │              (独立线程)            (独立线程)             │
+#   └──────────────────────────────────────────────────────────┘
+#
+#   核心组件：
+#   - MessageBus:      JSONL 文件的读写封装，提供 send/read_inbox/broadcast
+#   - TeammateManager: 队友生命周期管理 (spawn/list/config 持久化)
+#   - Request Trackers: shutdown_requests / plan_requests 字典
+#                       key=request_id, value={status, from/target, ...}
+#   - TOOL_HANDLERS:    Lead 的 12 个工具分发 map
+#   - _teammate_tools:  Teammate 的工具列表（含 protocol 工具）
+#
+#
+# 三、关键实现逻辑 / Key Implementation Details
+# ────────────────────────────────────────────────────────────────────
+#
+# 1. 关闭协议 (Shutdown Protocol) — FSM: pending → approved | rejected
+#    ───────────────────────────────────────────────────────────
+#    Lead:  shutdown_request(teammate) → 生成 req_id → 写入
+#           shutdown_requests[req_id] = {target, status: "pending"}
+#           → 通过 BUS 发送 shutdown_request 到目标队友的 inbox
+#
+#    Teammate: 在 agent loop 中轮询 inbox → 收到 shutdown_request →
+#              调用 shutdown_response(request_id, approve=True/False)
+#              → 更新 shutdown_requests[req_id].status →
+#              通过 BUS 发送 shutdown_response 回到 lead inbox
+#              → approve=True 时设置 should_exit = True，线程退出
+#
+#    Lead:  收到 shutdown_response → shutdown_response 工具只是
+#           查询 shutdown_requests 状态（当前实现中为被动查询）
+#
+# 2. 计划审批协议 (Plan Approval Protocol) — FSM: pending → approved | rejected
+#    ───────────────────────────────────────────────────────────────
+#    Teammate: 调用 plan_approval(plan="...") → 生成 req_id →
+#              写入 plan_requests[req_id] = {from, plan, status: "pending"}
+#              → 通过 BUS 发送 plan_approval_response 到 lead inbox
+#              → 返回 "Waiting for lead approval" 给模型
+#
+#    Lead:   在 agent loop 中收到 plan_approval_response →
+#            调用 plan_approval(request_id, approve=True/False, feedback)
+#            → 更新 plan_requests[req_id].status →
+#            通过 BUS 发送 plan_approval_response 回队友 inbox
+#            → 队友在下一轮 poll 中读到结果
+#
+# 3. Teammate 的 Agent Loop（_teammate_loop）
+#    ─────────────────────────────────────────
+#    - 每个队友在独立 daemon 线程中运行
+#    - 最多 50 轮迭代，每轮：poll inbox → 注入消息到 LLM context →
+#      调用 LLM → 执行 tool_use → 将结果反馈给 LLM
+#    - stop_reason != "tool_use" 时退出（LLM 自然结束）
+#    - shutdown_response(approve=True) 后设置 should_exit，退出线程
+#    - 退出后更新 config.json 中的 status（shutdown/idle）
+#
+# 4. 请求追踪器 (Request Trackers) 的线程安全
+#    ──────────────────────────────────────────
+#    - 用 _tracker_lock (threading.Lock) 保护所有读写
+#    - shutdown_requests 和 plan_requests 是两个独立字典，
+#      分别追踪关闭请求和计划审批请求
+#    - 两者使用完全相同的 pattern：{request_id: {status, ...}}
+#
+# 5. 路径安全 (_safe_path)
+#    ─────────────────────
+#    - 所有文件操作必须先通过 _safe_path 解析
+#    - 使用 Path.resolve() + is_relative_to() 防止路径逃逸攻击
+#
+# 6. 配置持久化
+#    ───────────
+#    - TeammateManager 使用 .team/config.json 存储团队状态
+#    - spawn 时创建/更新成员记录，loop 结束时更新 status
+#    - 可在进程重启后恢复团队状态
+#
+# 7. 消息类型校验
+#    ─────────────
+#    - VALID_MSG_TYPES 白名单控制所有消息类型
+#    - MessageBus.send() 在入口处校验，拒绝未知类型
+#    - Lead 和 Teammate 的 send_message 工具 schema 均引用此集合
+#
+# 四、与前序模块的关系 / Relationship with Previous Modules
+# ────────────────────────────────────────────────────────────────────
+# s09 (Team Messaging):    提供了 MessageBus + send_message/read_inbox
+#                            + broadcast 基础设施
+# s10 (Team Protocols):    在 s09 之上叠加了协议层：
+#                           - shutdown_request / shutdown_response
+#                           - plan_approval / plan_approval_response
+#                           - request_id 关联 + 追踪器状态机
+#                           - TeammateManager 的 spawn 生命周期管理
+#
+# s02 (Base Tools):        提供了 bash/read_file/write_file/edit_file
+#                           基础工具实现，s10 中标注为 "unchanged from s02"
+# ====================================================================

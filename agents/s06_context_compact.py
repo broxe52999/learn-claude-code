@@ -131,7 +131,7 @@ def micro_compact(messages: list) -> list:
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
 # -- 第 2 层：自动压缩 —— 保存对话记录、生成摘要、替换全部消息 --
-def auto_compact(messages: list) -> list:
+def auto_compact(messages: list, focus: str = "") -> list:
     """自动压缩：将完整对话存档到磁盘，用 LLM 生成摘要，然后将消息列表替换为摘要。"""
     # Save full transcript to disk / 将完整对话记录保存到磁盘
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
