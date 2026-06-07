@@ -841,3 +841,196 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+
+
+# ============================================================================
+#  设计总结：设计思想与关键流逻辑
+#  Design Summary: Design Philosophy & Key Flow Logic
+# ============================================================================
+#
+# 一、核心设计思想 / Core Design Philosophy
+# ─────────────────────────────────────────────
+# 1. 【双平面架构 — 控制平面与执行平面分离】
+#    Two-Plane Architecture: Control Plane + Execution Plane
+#
+#    控制平面 (TaskManager)：管理「做什么」—— 任务的创建、状态流转、绑定关系。
+#    执行平面 (WorktreeManager)：管理「在哪做」—— git worktree 的创建、隔离执行、清理。
+#    两者通过 task_id ↔ worktree name 的绑定关系耦合，各自独立演进。
+#
+# 2. 【目录级隔离 — 永不冲突的并行通道】
+#    Directory-Level Isolation: Parallel Lanes That Never Collide
+#
+#    每个任务拥有独立的 git worktree（物理目录），彼此之间的
+#    文件修改、依赖安装、构建产物完全隔离，从根本上杜绝竞态条件。
+#    核心洞察：「按目录隔离，按任务 ID 协调。」
+#
+# 3. 【Agent-Native 工具化 — 让 LLM 直接驾驭生命周期】
+#    Agent-Native Tooling: LLM Directly Drives the Lifecycle
+#
+#    将 task 和 worktree 的全生命周期（创建→绑定→执行→保留/移除→完成）
+#    暴露为 LLM 可调用的工具函数，agent 无需人工介入即可自主编排并行工作流、
+#    分配隔离通道、在关闭阶段选择 keep 或 remove。
+#
+# 4. 【可观测性第一 — 仅追加的不可变事件日志】
+#    Observability First: Append-Only Immutable Event Log
+#
+#    EventBus 以 JSONL 格式记录所有生命周期事件（create/remove/keep/completed/failed），
+#    为调试、审计和 agent 自我感知（worktree_events 工具）提供统一的事件溯源能力。
+#
+# 5. 【持久化协调 — 文件即状态，无外部依赖】
+#    Persistent Coordination: File-as-State, Zero External Dependencies
+#
+#    任务状态持久化在 .tasks/task_{id}.json，工作树索引持久化在
+#    .worktrees/index.json。无需数据库、无需消息队列，纯文件系统即可实现
+#    跨 agent 实例、跨会话的状态共享与协调。
+#
+# 6. 【渐进式安全护栏 — 分层防御】
+#    Progressive Safety Guardrails: Defense in Depth
+#
+#    - 工作树名称校验：正则限制 1-40 字符，仅允许安全字符集
+#    - 危险命令拦截：block dangerous patterns (sudo, rm -rf /, etc.)
+#    - 路径逃逸防护：safe_path() 确保所有文件操作不超出工作目录
+#    - 超时保护：bash 120s / worktree_run 300s 防止失控进程
+#
+#
+# 二、关键流逻辑 / Key Flow Logic
+# ─────────────────────────────────
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │                     Agent 主循环                            │
+#   │  user query → agent_loop() → LLM 决策 → 工具调用 → 返回结果  │
+#   └─────────────────────────────────────────────────────────────┘
+#                               │
+#                               ▼
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  LLM 可用工具集 (15 tools):                                  │
+#   │  ┌──────────┬──────────────┬──────────────────────────────┐ │
+#   │  │ 类别     │ 工具         │ 作用                         │ │
+#   │  ├──────────┼──────────────┼──────────────────────────────┤ │
+#   │  │ 基础     │ bash         │ 当前工作目录执行命令          │ │
+#   │  │          │ read_file    │ 读取文件内容                  │ │
+#   │  │          │ write_file   │ 写入文件内容                  │ │
+#   │  │          │ edit_file    │ 精确文本替换                  │ │
+#   │  ├──────────┼──────────────┼──────────────────────────────┤ │
+#   │  │ 任务     │ task_create  │ 创建任务 → 持久化到 .tasks/   │ │
+#   │  │          │ task_list    │ 列出所有任务 (含状态图标)     │ │
+#   │  │          │ task_get     │ 按 ID 查看任务详情            │ │
+#   │  │          │ task_update  │ 更新状态/所有者               │ │
+#   │  │          │ task_bind_wt │ 绑定任务到工作树              │ │
+#   │  ├──────────┼──────────────┼──────────────────────────────┤ │
+#   │  │ 工作树   │ wt_create    │ 创建 git worktree            │ │
+#   │  │          │ wt_list      │ 列出索引中的工作树            │ │
+#   │  │          │ wt_status    │ 查看工作树 git status         │ │
+#   │  │          │ wt_run       │ 在工作树内执行命令            │ │
+#   │  │          │ wt_keep      │ 标记保留 (不物理删除)         │ │
+#   │  │          │ wt_remove    │ 移除工作树 + 可选完成任务     │ │
+#   │  ├──────────┼──────────────┼──────────────────────────────┤ │
+#   │  │ 可观测   │ wt_events    │ 查询最近 N 条生命周期事件     │ │
+#   │  └──────────┴──────────────┴──────────────────────────────┘ │
+#   └─────────────────────────────────────────────────────────────┘
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  典型并行任务工作流:                                         │
+#   │                                                             │
+#   │  1. task_create("Refactor auth", "...")   ← 控制平面        │
+#   │  2. task_create("Add logging", "...")                       │
+#   │                                                             │
+#   │  3. worktree_create("auth-fix", task_id=1) ← 执行平面       │
+#   │     ├─ git worktree add -b wt/auth-fix ...                  │
+#   │     ├─ task_bind_worktree(1, "auth-fix")                    │
+#   │     └─ emit("worktree.create.after")                        │
+#   │                                                             │
+#   │  4. worktree_create("logging", task_id=2)                   │
+#   │                                                             │
+#   │  5. worktree_run("auth-fix", "pytest tests/auth/")          │
+#   │     → 在隔离目录中执行，互不干扰                              │
+#   │                                                             │
+#   │  6. worktree_run("logging", "go test ./...")                │
+#   │                                                             │
+#   │  7. 关闭阶段 (closeout):                                     │
+#   │     ├─ worktree_keep("auth-fix")     ← 成果保留             │
+#   │     └─ worktree_remove("logging", complete_task=True)        │
+#   │         ├─ git worktree remove ...                          │
+#   │         ├─ task_update(2, status="completed")               │
+#   │         └─ emit("task.completed")                           │
+#   └─────────────────────────────────────────────────────────────┘
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  任务状态机:                                                 │
+#   │                                                             │
+#   │  pending ──(bind_worktree)──▶ in_progress                   │
+#   │     │                            │                          │
+#   │     │                            ├──(keep)──▶ kept          │
+#   │     │                            │                          │
+#   │     └──(update)──────────────────▶ completed                │
+#   │                                  ▲                          │
+#   │                     (remove +    │                          │
+#   │                    complete_task)┘                          │
+#   └─────────────────────────────────────────────────────────────┘
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  工作树状态机:                                               │
+#   │                                                             │
+#   │  active ──(keep)──▶ kept     (保留，不删除物理目录)         │
+#   │     │                                                       │
+#   │     └──(remove)──▶ removed  (git worktree remove + 索引标记)│
+#   └─────────────────────────────────────────────────────────────┘
+#
+#
+# 三、数据模型 / Data Model
+# ──────────────────────────
+#
+#   .tasks/task_{id}.json:
+#   {
+#     "id": int,            # 自增唯一标识
+#     "subject": str,       # 任务标题
+#     "description": str,   # 任务描述
+#     "status": enum,       # pending | in_progress | completed
+#     "owner": str,         # 执行者标识
+#     "worktree": str,      # 绑定工作树名称 (空字符串 = 未绑定)
+#     "blockedBy": [int],   # 阻塞依赖 (预留，当前未使用)
+#     "created_at": float,  # 创建时间戳
+#     "updated_at": float   # 最后更新时间戳
+#   }
+#
+#   .worktrees/index.json:
+#   {
+#     "worktrees": [{
+#       "name": str,        # 工作树名称 (唯一标识)
+#       "path": str,        # 物理路径
+#       "branch": str,      # git 分支名 (wt/{name})
+#       "task_id": int|null,# 绑定的任务 ID
+#       "status": enum,     # active | kept | removed
+#       "created_at": float,# 创建时间戳
+#       "kept_at": float,   # 保留时间戳 (可选)
+#       "removed_at": float # 移除时间戳 (可选)
+#     }]
+#   }
+#
+#   .worktrees/events.jsonl:
+#   每行一个 JSON 对象:
+#   { "event": str, "ts": float, "task": {}, "worktree": {}, "error?": str }
+#
+#   事件类型:
+#     worktree.create.before  worktree.create.after  worktree.create.failed
+#     worktree.remove.before  worktree.remove.after  worktree.remove.failed
+#     worktree.keep
+#     task.completed
+#
+#
+# 四、类职责一览 / Class Responsibility Overview
+# ────────────────────────────────────────────────
+#
+#   EventBus       — 仅追加 JSONL 事件日志，提供 emit() 和 list_recent()
+#   TaskManager    — 任务的 CRUD + 状态流转 + 工作树绑定/解绑
+#   WorktreeManager— git worktree 生命周期管理 + 索引维护 + 事件发射
+#   TOOL_HANDLERS  — 将上述能力封装为 LLM 可调用的 15 个工具函数
+#   agent_loop()   — 标准 Anthropic tool-use 循环，连接 LLM 与工具执行
+#
+# 五、与前面章节的演进关系
+# ────────────────────────
+#   s01-s09: 逐步构建基础工具 (bash/read/write/edit) + agent_loop
+#   s10-s11: 引入任务板和文件持久化
+#   s12:     首次引入 git worktree 作为执行平面，实现「控制-执行」双平面架构
+#             —— 这是从「单线程 agent」到「并行多通道 agent」的关键跃迁。
+# ============================================================================
