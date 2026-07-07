@@ -440,7 +440,7 @@ def _safe_path(p: str) -> Path:
 
 def _run_bash(command: str) -> str:
     """执行 shell 命令，阻止危险命令，超时 120 秒"""
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
@@ -645,3 +645,162 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+
+
+# 我发现由于工具是大模型自己决策的，导致代码流程中的一些逻辑都变成了黑盒，就是比如子agent 把完成的任务给父agent是哪一步我就完全不懂了，后来发现原来是调用了send_message
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUMMARY: Design Philosophy & Key Logic / 设计思想与关键逻辑总结
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+一、核心设计思想 (Design Philosophy)
+──────────────────────────────────────
+
+1. 自主性优先 (Autonomy-First)
+   传统 agent 模型是 "人给任务 → agent 执行 → 结束"，而这里实现的是
+   "agent 自己找活干"。队友 spawn 之后不是被动等待指令，而是进入
+   WORK→IDLE→WORK 的自我维系循环。核心洞察就一句：
+   "The agent finds work itself."
+
+2. 任务板驱动 (Task-Board-Driven)
+   所有工作通过 .tasks/task_*.json 文件来描述和追踪。任务板是团队共享的
+   单一事实来源 (Single Source of Truth)。每个 JSON 包含 id/subject/
+   description/status/owner/blockedBy 字段，构成了一个微型的项目管理系统。
+
+3. 消息总线通信 (MessageBus Communication)
+   JSONL 文件作为收件箱，每个 agent 一个 .team/inbox/{name}.jsonl 文件。
+   这提供了：
+   - 持久化：消息不丢，跨进程可读
+   - 解耦：发送者和接收者不需要同时在线
+   - 可审计：所有通信历史可追溯
+   Drain 语义 (读后即清) 保证消息不会被重复处理。
+
+4. 身份连续性 (Identity Continuity)
+   LLM 上下文压缩（context compression）后，agent 可能"忘记"自己是谁。
+   身份重新注入机制 (make_identity_block) 确保：
+   - 在消息列表过短（≤3 条）时自动插入身份块
+   - agent 始终知道自己的名字、角色和所属团队
+
+5. Lead/Teammate 分级架构 (Hierarchical Architecture)
+   - Lead：管理者，拥有 spawn/shutdown/broadcast/plan_approval 等管理工具
+   - Teammate：工作者，拥有 bash/edit/send_message/claim_task/idle 等执行工具
+   这种分级使得系统可以"一个人管理一群人"，而非扁平无组织。
+
+6. 优雅状态机 (Graceful State Machine)
+   每个 agent 的生命周期是明确的状态机：
+   working → idle → working (有任务时恢复)
+                    → shutdown (超时 60s 无任务)
+
+7. 协议化协调 (Protocol-Based Coordination)
+   不是简单的函数调用，而是通过消息协议来协调：
+   - shutdown_request / shutdown_response：优雅关闭
+   - plan_approval / plan_approval_response：计划审批
+   - broadcast：全员通知
+   每种协议都有 request_id 追踪，保证请求-响应可匹配。
+
+
+二、关键逻辑实现 (Key Logic Implementation)
+──────────────────────────────────────────
+
+1. 自主生命周期循环 (_loop)
+   ───────────────────────────
+   TeammateManager._loop() 是整个系统的心脏，实现了：
+   
+   外层 while True 循环包裹两个阶段：
+
+   【WORK 阶段】（最多 50 轮工具调用）
+   - 每轮先 drain 收件箱，将消息拼入 messages
+   - 调用 LLM 获取 response
+   - 如果 stop_reason != "tool_use"（模型说完话了），进入 IDLE
+   - 如果模型调用了 idle 工具（主动请求空闲），也进入 IDLE
+   - 否则执行工具调用，将结果拼回 messages，继续下一轮
+
+   【IDLE 阶段】（每 5s 轮询，最多 60s）
+   - 检查收件箱 → 有新消息 → 恢复 WORK
+   - 扫描 .tasks/ 目录 → 有未认领任务 → 自动认领 → 恢复 WORK
+   - 超时 → 优雅 shutdown
+
+   这个设计让 agent 永远不会"卡住"——要么在工作，要么在找活干。
+
+2. 任务认领的线程安全 (claim_task)
+   ──────────────────────────────
+   使用 threading.Lock() 保护临界区，确保：
+   - 检查任务是否存在
+   - 检查任务状态是否为 pending
+   - 检查是否已被他人认领（owner 字段）
+   - 检查是否有阻塞依赖（blockedBy 字段）
+   - 原子性地设置 owner 和 status = "in_progress"
+
+   没有这个锁，两个 agent 可能同时认领同一个任务（race condition）。
+
+3. 消息总线的 Drain 语义 (read_inbox)
+   ──────────────────────────────
+   BUS.read_inbox(name) 的逻辑：
+   1. 打开 {name}.jsonl
+   2. 读取所有 JSON 行 → 返回列表
+   3. 立即清空文件 (write_text(""))
+   
+   这保证了每条消息恰好被处理一次 (exactly-once semantics)。
+   不像消息队列有 ack 机制，这里用最简单的方式：读即清。
+
+4. 身份重新注入 (make_identity_block)
+   ──────────────────────────────
+   触发条件：len(messages) <= 3（消息列表被压缩过的信号）
+   
+   操作：
+   1. messages.insert(0, identity_block)  —— 插到最前面
+   2. messages.insert(1, "I am {name}. Continuing.") —— 确认身份
+   3. 然后追加任务提示
+   
+   这解决了 LLM 在长对话压缩后"我是谁？我在哪？"的问题。
+
+5. 工具分发与协议处理 (_exec + TOOL_HANDLERS)
+   ──────────────────────────────
+   - Teammate 的 _exec() 是 if/elif 链分发，每个工具名对应一个处理函数
+   - Lead 的 TOOL_HANDLERS 是 dict-lambda 分发，更紧凑
+   
+   协议工具（shutdown_response, plan_approval）会：
+   1. 更新全局跟踪器 (shutdown_requests / plan_requests)
+   2. 通过 BUS 发送响应消息给 Lead
+   3. 返回状态字符串给 LLM
+
+6. 优雅关闭链路 (Shutdown Flow)
+   ──────────────────────────────
+   Lead 调用 shutdown_request(teammate) →
+     BUS.send("lead", teammate, ..., "shutdown_request") →
+       队友在 WORK 或 IDLE 阶段 drain 收件箱 →
+         发现 shutdown_request →
+           _set_status("shutdown") + return（线程退出）
+
+   整个链路是异步、非强制的，队友会在当前循环轮次结束时优雅退出。
+
+7. 团队持久化 (Team Persistence)
+   ──────────────────────────────
+   TeammateManager 将团队配置写入 .team/config.json：
+   { "team_name": "...", "members": [
+       {"name": "...", "role": "...", "status": "..."}
+   ]}
+   
+   每次状态变更（spawn/status change）都会即时持久化。
+   这保证了系统崩溃后可以恢复团队状态。
+
+
+三、与前面步骤的演进关系 (Evolution from Previous Steps)
+──────────────────────────────────────────
+s02: 基础 agent loop（bash/read/write/edit）
+s10: 通信协议（MessageBus, inbox, shutdown, plan_approval）
+s11: 自主性（idle poll, auto-claim, identity re-injection, WORK→IDLE→WORK）
+
+s11 是 s10 的自然延伸：s10 提供了通信基础设施，s11 在此基础上
+让 agent 从"被动响应"升级为"主动寻找工作"。
+
+四、设计取舍 (Design Trade-offs)
+──────────────────────────────
+✓ 简单性 > 完备性：文件系统而非数据库，JSONL 而非消息队列
+✓ 自主性 > 可控性：agent 自己找活干，而非 Lead 精确调度
+✓ 可见性 > 性能：所有状态存在文件中，可随时 cat 查看
+✗ 不适合高并发（文件锁而非分布式锁）
+✗ 不适合长任务（50 轮工具调用上限，60s 空闲超时）
+✗ 没有错误重试和死信队列
+"""

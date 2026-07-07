@@ -291,7 +291,7 @@ def _safe_path(p: str) -> Path:
 
 def _run_bash(command: str) -> str:
     """执行 shell 命令，阻止危险命令，超时 120 秒"""
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
@@ -440,3 +440,20 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+
+
+# 设计思想总结：
+# 1. 这个示例把一次性 subagent 扩展成“持久化队友”：队友不是执行完就销毁，而是有名字、角色和状态，
+#    可以反复接收任务、空闲等待，并通过 `.team/config.json` 留下团队成员记录。
+# 2. 团队协作的核心是文件邮箱，而不是共享内存里的直接函数调用。每个成员对应一个 JSONL inbox，
+#    `send_message` 只负责追加消息，`read_inbox` 负责读取并清空，形成简单可靠的 drain 语义。
+# 3. `TeammateManager` 负责成员生命周期：创建或复用成员、启动独立线程运行 teammate agent loop、
+#    维护 `working/idle/shutdown` 状态，并把这些状态持久化到配置文件。
+# 4. lead 和 teammate 都是 agent loop，但职责不同：lead 负责拆分任务、拉起队友、广播或发消息；
+#    teammate 负责在自己的线程中读 inbox、调用 LLM、执行工具，并在完成后回到 idle。
+# 5. 消息通过对话历史重新交给模型决策：lead 每轮调用 LLM 前会 drain 自己的 inbox 并注入 `<inbox>`，
+#    teammate 每轮也会读取自己的 inbox。这样“团队通信”仍然落在模型可见的上下文里。
+# 6. JSONL inbox 的方法牺牲了强一致和复杂调度，换来可观察、可持久化、可手工检查的协作通道；
+#    这正是 agent harness 的教学重点：先用简单机制搭出多代理协作的最小闭环。
+# 7. 这个文件表达的方法是：用线程承载并发执行，用文件承载跨 agent 通信，用配置承载团队状态，
+#    再用工具接口把这些能力暴露给模型，让模型像 team lead 一样组织多个可通信的工作代理。

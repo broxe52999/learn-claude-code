@@ -131,7 +131,7 @@ def micro_compact(messages: list) -> list:
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
 # -- 第 2 层：自动压缩 —— 保存对话记录、生成摘要、替换全部消息 --
-def auto_compact(messages: list) -> list:
+def auto_compact(messages: list, focus: str = "") -> list:
     """自动压缩：将完整对话存档到磁盘，用 LLM 生成摘要，然后将消息列表替换为摘要。"""
     # Save full transcript to disk / 将完整对话记录保存到磁盘
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
@@ -142,12 +142,16 @@ def auto_compact(messages: list) -> list:
     print(f"[transcript saved: {transcript_path}]")
     # Ask LLM to summarize / 请求 LLM 生成摘要
     conversation_text = json.dumps(messages, default=str)[-80000:]
+    focus_instruction = ""
+    if focus:
+        focus_instruction = f" Pay special attention to preserving details about: {focus}."
     response = client.messages.create(
         model=MODEL,
         messages=[{"role": "user", "content":
             "Summarize this conversation for continuity. Include: "
             "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details.\n\n" + conversation_text}],
+            "Be concise but preserve critical details."
+            f"{focus_instruction}\n\n" + conversation_text}],
         max_tokens=2000,
     )
     summary = next((block.text for block in response.content if hasattr(block, "text")), "")
@@ -261,11 +265,13 @@ def agent_loop(messages: list):
             return
         results = []
         manual_compact = False
+        compact_focus = ""
         for block in response.content:
             if block.type == "tool_use":
                 if block.name == "compact":
                     # 第 3 层：模型主动请求手动压缩
                     manual_compact = True
+                    compact_focus = block.input.get("focus", "")
                     output = "Compressing..."
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
@@ -281,7 +287,7 @@ def agent_loop(messages: list):
         # 第 3 层：compact 工具触发手动压缩
         if manual_compact:
             print("[manual compact]")
-            messages[:] = auto_compact(messages)
+            messages[:] = auto_compact(messages, focus=compact_focus)
             return
 
 

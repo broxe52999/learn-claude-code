@@ -2,7 +2,7 @@
   "versions": [
     {
       "id": "s01",
-      "filename": "s01_agent_loop.py",
+      "filename": "s01_agent_loop/code.py",
       "title": "The Agent Loop",
       "subtitle": "Bash is All You Need",
       "loc": 95,
@@ -12,8 +12,8 @@
       "newTools": [
         "bash"
       ],
-      "coreAddition": "Single-tool agent loop",
-      "keyInsight": "The minimal agent kernel is a while loop + one tool",
+      "coreAddition": "Minimal model/tool loop",
+      "keyInsight": "The smallest useful agent is a loop that calls the model, runs tools, and feeds results back.",
       "classes": [],
       "functions": [
         {
@@ -40,15 +40,17 @@
         "bash",
         "read_file",
         "write_file",
-        "edit_file"
+        "edit_file",
+        "glob"
       ],
       "newTools": [
         "read_file",
         "write_file",
-        "edit_file"
+        "edit_file",
+        "glob"
       ],
       "coreAddition": "Tool dispatch map",
-      "keyInsight": "The loop stays the same; new tools register into the dispatch map",
+      "keyInsight": "The loop stays stable while capabilities register into a dispatch table.",
       "classes": [],
       "functions": [
         {
@@ -229,6 +231,10 @@
           "endLine": 117
         }
       ],
+      "newTools": [],
+      "coreAddition": "Permission gate",
+      "keyInsight": "Dangerous actions need a harness decision point before the shell runs.",
+      "classes": [],
       "functions": [
         {
           "name": "safe_path",
@@ -275,13 +281,481 @@
         "read_file",
         "write_file",
         "edit_file",
+        "glob"
+      ],
+      "newTools": [],
+      "coreAddition": "Lifecycle hooks",
+      "keyInsight": "Cross-cutting behavior belongs around the loop, not tangled inside it.",
+      "classes": [],
+      "functions": [
+        {
+          "name": "safe_path",
+          "signature": "def safe_path(p: str)",
+          "startLine": 81
+        },
+        {
+          "name": "run_bash",
+          "signature": "def run_bash(command: str)",
+          "startLine": 87
+        },
+        {
+          "name": "run_read",
+          "signature": "def run_read(path: str, limit: int | None = None)",
+          "startLine": 96
+        },
+        {
+          "name": "run_write",
+          "signature": "def run_write(path: str, content: str)",
+          "startLine": 105
+        },
+        {
+          "name": "run_edit",
+          "signature": "def run_edit(path: str, old_text: str, new_text: str)",
+          "startLine": 114
+        },
+        {
+          "name": "run_glob",
+          "signature": "def run_glob(pattern: str)",
+          "startLine": 125
+        },
+        {
+          "name": "register_hook",
+          "signature": "def register_hook(event: str, callback)",
+          "startLine": 161
+        },
+        {
+          "name": "trigger_hooks",
+          "signature": "def trigger_hooks(event: str, *args)",
+          "startLine": 164
+        },
+        {
+          "name": "permission_hook",
+          "signature": "def permission_hook(block)",
+          "startLine": 176
+        },
+        {
+          "name": "log_hook",
+          "signature": "def log_hook(block)",
+          "startLine": 200
+        },
+        {
+          "name": "large_output_hook",
+          "signature": "def large_output_hook(block, output)",
+          "startLine": 206
+        },
+        {
+          "name": "context_inject_hook",
+          "signature": "def context_inject_hook(query: str)",
+          "startLine": 213
+        },
+        {
+          "name": "summary_hook",
+          "signature": "def summary_hook(messages: list)",
+          "startLine": 218
+        },
+        {
+          "name": "agent_loop",
+          "signature": "def agent_loop(messages: list)",
+          "startLine": 238
+        }
+      ],
+      "layer": "tools",
+      "source": "#!/usr/bin/env python3\n\"\"\"\ns04: Hooks — move extension logic out of the loop, onto hooks.\n\n  User types query\n       │\n       ▼\n  ┌──────────────────┐\n  │ UserPromptSubmit │ ── trigger_hooks() before LLM\n  └────────┬─────────┘\n           ▼\n  ┌────────────┐     ┌─────────────────────────────┐\n  │  messages  │────▶│  LLM (stop_reason=tool_use?)│\n  └────────────┘     │   No ──▶ Stop hooks ──▶ exit │\n                     │   Yes ──▶ tool_use block ──┐ │\n                     └────────────────────────────┘ │\n                                                    ▼\n                                          ┌──────────────────┐\n                                          │ trigger_hooks()   │\n                                          │  PreToolUse:      │\n                                          │   permission_hook │\n                                          │   log_hook        │\n                                          └───────┬──────────┘\n                                                  │ (not blocked)\n                                          ┌───────▼──────────┐\n                                          │ TOOL_HANDLERS[x]  │\n                                          └───────┬──────────┘\n                                                  │\n                                          ┌───────▼──────────┐\n                                          │ trigger_hooks()   │\n                                          │  PostToolUse:     │\n                                          │   large_output    │\n                                          └───────┬──────────┘\n                                                  │\n                                          results ──▶ back to messages\n\nChanges from s03:\n  + HOOKS registry (event -> list of callbacks)\n  + register_hook() / trigger_hooks()\n  + context_inject_hook (UserPromptSubmit)\n  + permission_hook, log_hook (PreToolUse)\n  + large_output_hook (PostToolUse)\n  + summary_hook (Stop)\n  - check_permission() removed from loop body\n    (logic moved into permission_hook, triggered via PreToolUse)\n\nRun: python s04_hooks/code.py\nNeeds: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env\n\"\"\"\n\nimport os, subprocess\nfrom pathlib import Path\n\ntry:\n    import readline\n    readline.parse_and_bind('set bind-tty-special-chars off')\n    readline.parse_and_bind('set input-meta on')\n    readline.parse_and_bind('set output-meta on')\n    readline.parse_and_bind('set convert-meta off')\nexcept ImportError:\n    pass\n\nfrom anthropic import Anthropic\nfrom dotenv import load_dotenv\n\nload_dotenv(override=True)\nif os.getenv(\"ANTHROPIC_BASE_URL\"):\n    os.environ.pop(\"ANTHROPIC_AUTH_TOKEN\", None)\n\nWORKDIR = Path.cwd()\nclient = Anthropic(base_url=os.getenv(\"ANTHROPIC_BASE_URL\"))\nMODEL = os.environ[\"MODEL_ID\"]\n\nSYSTEM = f\"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain.\"\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s02-s03 (unchanged): Tool Implementations\n# ═══════════════════════════════════════════════════════════\n\ndef safe_path(p: str) -> Path:\n    path = (WORKDIR / p).resolve()\n    if not path.is_relative_to(WORKDIR):\n        raise ValueError(f\"Path escapes workspace: {p}\")\n    return path\n\ndef run_bash(command: str) -> str:\n    try:\n        r = subprocess.run(command, shell=True, cwd=WORKDIR,\n                           capture_output=True, text=True, timeout=120)\n        out = (r.stdout + r.stderr).strip()\n        return out[:50000] if out else \"(no output)\"\n    except subprocess.TimeoutExpired:\n        return \"Error: Timeout (120s)\"\n\ndef run_read(path: str, limit: int | None = None) -> str:\n    try:\n        lines = safe_path(path).read_text().splitlines()\n        if limit and limit < len(lines):\n            lines = lines[:limit] + [f\"... ({len(lines) - limit} more lines)\"]\n        return \"\\n\".join(lines)\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_write(path: str, content: str) -> str:\n    try:\n        file_path = safe_path(path)\n        file_path.parent.mkdir(parents=True, exist_ok=True)\n        file_path.write_text(content)\n        return f\"Wrote {len(content)} bytes to {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_edit(path: str, old_text: str, new_text: str) -> str:\n    try:\n        file_path = safe_path(path)\n        text = file_path.read_text()\n        if old_text not in text:\n            return f\"Error: text not found in {path}\"\n        file_path.write_text(text.replace(old_text, new_text, 1))\n        return f\"Edited {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_glob(pattern: str) -> str:\n    import glob as g\n    try:\n        results = []\n        for match in g.glob(pattern, root_dir=WORKDIR):\n            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):\n                results.append(match)\n        return \"\\n\".join(results) if results else \"(no matches)\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\nTOOLS = [\n    {\"name\": \"bash\", \"description\": \"Run a shell command.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}},\n    {\"name\": \"read_file\", \"description\": \"Read file contents.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}},\n    {\"name\": \"write_file\", \"description\": \"Write content to a file.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}},\n    {\"name\": \"edit_file\", \"description\": \"Replace exact text in a file once.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_text\": {\"type\": \"string\"}, \"new_text\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old_text\", \"new_text\"]}},\n    {\"name\": \"glob\", \"description\": \"Find files matching a glob pattern.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}},\n]\n\nTOOL_HANDLERS = {\n    \"bash\": run_bash, \"read_file\": run_read, \"write_file\": run_write,\n    \"edit_file\": run_edit, \"glob\": run_glob,\n}\n\n\n# ═══════════════════════════════════════════════════════════\n#  NEW in s04: Hook System (s03 permission logic now via hooks)\n# ═══════════════════════════════════════════════════════════\n\nHOOKS = {\"UserPromptSubmit\": [], \"PreToolUse\": [], \"PostToolUse\": [], \"Stop\": []}\n\ndef register_hook(event: str, callback):\n    HOOKS[event].append(callback)\n\ndef trigger_hooks(event: str, *args):\n    for callback in HOOKS[event]:\n        result = callback(*args)\n        if result is not None:  # teaching shortcut: block this tool call\n            return result\n    return None\n\n\n# s03 permission check logic, now wrapped as a hook\nDENY_LIST = [\"rm -rf /\", \"sudo\", \"shutdown\", \"reboot\", \"mkfs\", \"dd if=\"]\nDESTRUCTIVE = [\"rm \", \"> /etc/\", \"chmod 777\"]\n\ndef permission_hook(block):\n    \"\"\"PreToolUse: s03 check_permission() logic moved here.\"\"\"\n    if block.name == \"bash\":\n        for pattern in DENY_LIST:\n            if pattern in block.input.get(\"command\", \"\"):\n                print(f\"\\n\\033[31m⛔ Blocked: '{pattern}'\\033[0m\")\n                return \"Permission denied by deny list\"\n        for kw in DESTRUCTIVE:\n            if kw in block.input.get(\"command\", \"\"):\n                print(f\"\\n\\033[33m⚠  Potentially destructive command\\033[0m\")\n                print(f\"   Tool: {block.name}({block.input})\")\n                choice = input(\"   Allow? [y/N] \").strip().lower()\n                if choice not in (\"y\", \"yes\"):\n                    return \"Permission denied by user\"\n    if block.name in (\"write_file\", \"edit_file\"):\n        path = block.input.get(\"path\", \"\")\n        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):\n            print(f\"\\n\\033[33m⚠  Writing outside workspace\\033[0m\")\n            print(f\"   Tool: {block.name}({block.input})\")\n            choice = input(\"   Allow? [y/N] \").strip().lower()\n            if choice not in (\"y\", \"yes\"):\n                return \"Permission denied by user\"\n    return None\n\ndef log_hook(block):\n    \"\"\"PreToolUse: log every tool call.\"\"\"\n    args_preview = str(list(block.input.values())[:2])[:60]\n    print(f\"\\033[90m[HOOK] {block.name}({args_preview})\\033[0m\")\n    return None\n\ndef large_output_hook(block, output):\n    \"\"\"PostToolUse: warn on large output.\"\"\"\n    if len(str(output)) > 100000:\n        print(f\"\\033[33m[HOOK] ⚠ Large output from {block.name}: {len(str(output))} chars\\033[0m\")\n    return None\n\n# UserPromptSubmit hook: log user input before it reaches the LLM\ndef context_inject_hook(query: str):\n    print(f\"\\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\\033[0m\")\n    return None\n\n# Stop hook: print summary when loop is about to exit\ndef summary_hook(messages: list):\n    tool_count = sum(1 for m in messages\n                     for b in (m.get(\"content\") if isinstance(m.get(\"content\"), list) else [])\n                     if isinstance(b, dict) and b.get(\"type\") == \"tool_result\")\n    print(f\"\\033[90m[HOOK] Stop: session used {tool_count} tool calls\\033[0m\")\n    return None\n\nregister_hook(\"UserPromptSubmit\", context_inject_hook)\nregister_hook(\"PreToolUse\", permission_hook)\nregister_hook(\"PreToolUse\", log_hook)\nregister_hook(\"PostToolUse\", large_output_hook)\nregister_hook(\"Stop\", summary_hook)\n\n\n# ═══════════════════════════════════════════════════════════\n#  agent_loop — same structure as s03, but no hard-coded check\n#  s03: if not check_permission(block): ...\n#  s04: if trigger_hooks(\"PreToolUse\", block): ...\n# ═══════════════════════════════════════════════════════════\n\ndef agent_loop(messages: list):\n    while True:\n        response = client.messages.create(\n            model=MODEL, system=SYSTEM, messages=messages,\n            tools=TOOLS, max_tokens=8000,\n        )\n        messages.append({\"role\": \"assistant\", \"content\": response.content})\n\n        if response.stop_reason != \"tool_use\":\n            force = trigger_hooks(\"Stop\", messages)\n            if force:\n                messages.append({\"role\": \"user\", \"content\": force})\n                continue\n            return\n\n        results = []\n        for block in response.content:\n            if block.type != \"tool_use\":\n                continue\n\n            # s04 change: hook replaces hard-coded check_permission()\n            blocked = trigger_hooks(\"PreToolUse\", block)\n            if blocked:\n                results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                                \"content\": str(blocked)})\n                continue\n\n            handler = TOOL_HANDLERS.get(block.name)\n            output = handler(**block.input) if handler else f\"Unknown: {block.name}\"\n\n            trigger_hooks(\"PostToolUse\", block, output)  # s04: post hook\n\n            results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id, \"content\": output})\n\n        messages.append({\"role\": \"user\", \"content\": results})\n\n\nif __name__ == \"__main__\":\n    print(\"s04: Hooks — extension logic on hooks, loop stays clean\")\n    print(\"Type a question, press Enter. Type q to quit.\\n\")\n\n    history = []\n    while True:\n        try:\n            query = input(\"\\033[36ms04 >> \\033[0m\")\n        except (EOFError, KeyboardInterrupt):\n            break\n        if query.strip().lower() in (\"q\", \"exit\", \"\"):\n            break\n        trigger_hooks(\"UserPromptSubmit\", query)\n        history.append({\"role\": \"user\", \"content\": query})\n        agent_loop(history)\n        for block in history[-1][\"content\"]:\n            if getattr(block, \"type\", None) == \"text\":\n                print(block.text)\n        print()\n",
+      "images": [
+        {
+          "src": "/course-assets/s04_hooks/hooks-overview.svg",
+          "alt": "hooks overview"
+        }
+      ]
+    },
+    {
+      "id": "s05",
+      "filename": "s05_todo_write/code.py",
+      "title": "TodoWrite",
+      "subtitle": "An Agent Without a Plan Drifts Off Course",
+      "loc": 236,
+      "tools": [
+        "bash",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "todo_write"
+      ],
+      "newTools": [
+        "todo_write"
+      ],
+      "coreAddition": "Todo manager",
+      "keyInsight": "Explicit plans keep long-running work visible and correctable.",
+      "classes": [],
+      "functions": [
+        {
+          "name": "safe_path",
+          "signature": "def safe_path(p: str)",
+          "startLine": 64
+        },
+        {
+          "name": "run_bash",
+          "signature": "def run_bash(command: str)",
+          "startLine": 70
+        },
+        {
+          "name": "run_read",
+          "signature": "def run_read(path: str, limit: int | None = None)",
+          "startLine": 79
+        },
+        {
+          "name": "run_write",
+          "signature": "def run_write(path: str, content: str)",
+          "startLine": 88
+        },
+        {
+          "name": "run_edit",
+          "signature": "def run_edit(path: str, old_text: str, new_text: str)",
+          "startLine": 97
+        },
+        {
+          "name": "run_glob",
+          "signature": "def run_glob(pattern: str)",
+          "startLine": 108
+        },
+        {
+          "name": "_normalize_todos",
+          "signature": "def _normalize_todos(todos)",
+          "startLine": 124
+        },
+        {
+          "name": "run_todo_write",
+          "signature": "def run_todo_write(todos: list)",
+          "startLine": 144
+        },
+        {
+          "name": "register_hook",
+          "signature": "def register_hook(event: str, callback)",
+          "startLine": 185
+        },
+        {
+          "name": "trigger_hooks",
+          "signature": "def trigger_hooks(event: str, *args)",
+          "startLine": 188
+        },
+        {
+          "name": "permission_hook",
+          "signature": "def permission_hook(block)",
+          "startLine": 198
+        },
+        {
+          "name": "log_hook",
+          "signature": "def log_hook(block)",
+          "startLine": 207
+        },
+        {
+          "name": "context_inject_hook",
+          "signature": "def context_inject_hook(query: str)",
+          "startLine": 212
+        },
+        {
+          "name": "summary_hook",
+          "signature": "def summary_hook(messages: list)",
+          "startLine": 217
+        },
+        {
+          "name": "agent_loop",
+          "signature": "def agent_loop(messages: list)",
+          "startLine": 237
+        }
+      ],
+      "layer": "planning",
+      "source": "#!/usr/bin/env python3\n\"\"\"\ns05: TodoWrite — add a planning tool on top of s04 hooks.\n\n  +---------+      +-------+      +------------------+\n  |  User   | ---> |  LLM  | ---> | TOOL_HANDLERS    |\n  | prompt  |      |       |      |  bash            |\n  +---------+      +---+---+      |  read_file       |\n                        ^         |  write_file      |\n                        | result  |  edit_file       |\n                        +---------+  glob            |\n                                      todo_write ← NEW\n                                   +------------------+\n                                        |\n                         in-memory current_todos\n                                        |\n                        if rounds_since_todo >= 3:\n                          inject <reminder>\n\nChanges from s04:\n  + todo_write tool + run_todo_write() implementation\n  + Nag reminder (inject reminder after 3 rounds without todo update)\n  + SYSTEM prompt includes \"plan before execute\" guidance\n  + rounds_since_todo counter in agent_loop\n  Loop unchanged: new tool auto-dispatches via TOOL_HANDLERS.\n\nRun: python s05_todo_write/code.py\nNeeds: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env\n\"\"\"\n\nimport ast, json, os, subprocess\nfrom pathlib import Path\n\ntry:\n    import readline\n    readline.parse_and_bind('set bind-tty-special-chars off')\nexcept ImportError:\n    pass\n\nfrom anthropic import Anthropic\nfrom dotenv import load_dotenv\n\nload_dotenv(override=True)\nif os.getenv(\"ANTHROPIC_BASE_URL\"):\n    os.environ.pop(\"ANTHROPIC_AUTH_TOKEN\", None)\n\nWORKDIR = Path.cwd()\nclient = Anthropic(base_url=os.getenv(\"ANTHROPIC_BASE_URL\"))\nMODEL = os.environ[\"MODEL_ID\"]\nCURRENT_TODOS: list[dict] = []\n\n# s05 change: SYSTEM prompt adds planning guidance\nSYSTEM = (\n    f\"You are a coding agent at {WORKDIR}. \"\n    \"Before starting any multi-step task, use todo_write to plan your steps. \"\n    \"Update status as you go.\"\n)\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s02-s04 (unchanged): Tool Implementations\n# ═══════════════════════════════════════════════════════════\n\ndef safe_path(p: str) -> Path:\n    path = (WORKDIR / p).resolve()\n    if not path.is_relative_to(WORKDIR):\n        raise ValueError(f\"Path escapes workspace: {p}\")\n    return path\n\ndef run_bash(command: str) -> str:\n    try:\n        r = subprocess.run(command, shell=True, cwd=WORKDIR,\n                           capture_output=True, text=True, timeout=120)\n        out = (r.stdout + r.stderr).strip()\n        return out[:50000] if out else \"(no output)\"\n    except subprocess.TimeoutExpired:\n        return \"Error: Timeout (120s)\"\n\ndef run_read(path: str, limit: int | None = None) -> str:\n    try:\n        lines = safe_path(path).read_text().splitlines()\n        if limit and limit < len(lines):\n            lines = lines[:limit] + [f\"... ({len(lines) - limit} more lines)\"]\n        return \"\\n\".join(lines)\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_write(path: str, content: str) -> str:\n    try:\n        file_path = safe_path(path)\n        file_path.parent.mkdir(parents=True, exist_ok=True)\n        file_path.write_text(content)\n        return f\"Wrote {len(content)} bytes to {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_edit(path: str, old_text: str, new_text: str) -> str:\n    try:\n        file_path = safe_path(path)\n        text = file_path.read_text()\n        if old_text not in text:\n            return f\"Error: text not found in {path}\"\n        file_path.write_text(text.replace(old_text, new_text, 1))\n        return f\"Edited {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_glob(pattern: str) -> str:\n    import glob as g\n    try:\n        results = []\n        for match in g.glob(pattern, root_dir=WORKDIR):\n            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):\n                results.append(match)\n        return \"\\n\".join(results) if results else \"(no matches)\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\n\n# ═══════════════════════════════════════════════════════════\n#  NEW in s05: todo_write tool — plan only, no execution\n# ═══════════════════════════════════════════════════════════\n\ndef _normalize_todos(todos):\n    if isinstance(todos, str):\n        try:\n            todos = json.loads(todos)\n        except json.JSONDecodeError:\n            try:\n                todos = ast.literal_eval(todos)\n            except (SyntaxError, ValueError):\n                return None, \"Error: todos must be a list or JSON array string\"\n    if not isinstance(todos, list):\n        return None, \"Error: todos must be a list\"\n    for i, t in enumerate(todos):\n        if not isinstance(t, dict):\n            return None, f\"Error: todos[{i}] must be an object\"\n        if \"content\" not in t or \"status\" not in t:\n            return None, f\"Error: todos[{i}] missing 'content' or 'status'\"\n        if t[\"status\"] not in (\"pending\", \"in_progress\", \"completed\"):\n            return None, f\"Error: todos[{i}] has invalid status '{t['status']}'\"\n    return todos, None\n\ndef run_todo_write(todos: list) -> str:\n    global CURRENT_TODOS\n    todos, error = _normalize_todos(todos)\n    if error:\n        return error\n    CURRENT_TODOS = todos\n    lines = [\"\\n\\033[33m## Current Tasks\\033[0m\"]\n    for t in CURRENT_TODOS:\n        icon = {\"pending\": \" \", \"in_progress\": \"\\033[36m▸\\033[0m\", \"completed\": \"\\033[32m✓\\033[0m\"}[t[\"status\"]]\n        lines.append(f\"  [{icon}] {t['content']}\")\n    print(\"\\n\".join(lines))\n    return f\"Updated {len(CURRENT_TODOS)} tasks\"\n\nTOOLS = [\n    {\"name\": \"bash\", \"description\": \"Run a shell command.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}},\n    {\"name\": \"read_file\", \"description\": \"Read file contents.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}},\n    {\"name\": \"write_file\", \"description\": \"Write content to a file.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}},\n    {\"name\": \"edit_file\", \"description\": \"Replace exact text in a file once.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_text\": {\"type\": \"string\"}, \"new_text\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old_text\", \"new_text\"]}},\n    {\"name\": \"glob\", \"description\": \"Find files matching a glob pattern.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}},\n    # s05: new tool\n    {\"name\": \"todo_write\", \"description\": \"Create and manage a task list for your current coding session.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"todos\": {\"type\": \"array\", \"items\": {\"type\": \"object\", \"properties\": {\"content\": {\"type\": \"string\"}, \"status\": {\"type\": \"string\", \"enum\": [\"pending\", \"in_progress\", \"completed\"]}}, \"required\": [\"content\", \"status\"]}}}, \"required\": [\"todos\"]}},\n]\n\nTOOL_HANDLERS = {\n    \"bash\": run_bash, \"read_file\": run_read, \"write_file\": run_write,\n    \"edit_file\": run_edit, \"glob\": run_glob, \"todo_write\": run_todo_write,\n}\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s04 (unchanged): Hook System\n# ═══════════════════════════════════════════════════════════\n\nHOOKS = {\"UserPromptSubmit\": [], \"PreToolUse\": [], \"PostToolUse\": [], \"Stop\": []}\n\ndef register_hook(event: str, callback):\n    HOOKS[event].append(callback)\n\ndef trigger_hooks(event: str, *args):\n    for callback in HOOKS[event]:\n        result = callback(*args)\n        if result is not None:\n            return result\n    return None\n\n# s04 hooks preserved\nDENY_LIST = [\"rm -rf /\", \"sudo\", \"shutdown\", \"reboot\", \"mkfs\", \"dd if=\"]\n\ndef permission_hook(block):\n    \"\"\"PreToolUse: deny list check.\"\"\"\n    if block.name == \"bash\":\n        for p in DENY_LIST:\n            if p in block.input.get(\"command\", \"\"):\n                print(f\"\\n\\033[31m⛔ Blocked: '{p}'\\033[0m\")\n                return \"Permission denied\"\n    return None\n\ndef log_hook(block):\n    \"\"\"PreToolUse: log tool calls.\"\"\"\n    print(f\"\\033[90m[HOOK] {block.name}\\033[0m\")\n    return None\n\ndef context_inject_hook(query: str):\n    \"\"\"UserPromptSubmit: log working directory.\"\"\"\n    print(f\"\\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\\033[0m\")\n    return None\n\ndef summary_hook(messages: list):\n    \"\"\"Stop: print tool call count.\"\"\"\n    tool_count = sum(1 for m in messages\n                     for b in (m.get(\"content\") if isinstance(m.get(\"content\"), list) else [])\n                     if isinstance(b, dict) and b.get(\"type\") == \"tool_result\")\n    print(f\"\\033[90m[HOOK] Stop: session used {tool_count} tool calls\\033[0m\")\n    return None\n\nregister_hook(\"UserPromptSubmit\", context_inject_hook)\nregister_hook(\"PreToolUse\", permission_hook)\nregister_hook(\"PreToolUse\", log_hook)\nregister_hook(\"Stop\", summary_hook)\n\n\n# ═══════════════════════════════════════════════════════════\n#  agent_loop — same as s04 + nag reminder counter\n# ═══════════════════════════════════════════════════════════\n\nrounds_since_todo = 0\n\ndef agent_loop(messages: list):\n    global rounds_since_todo\n    while True:\n        # s05: nag reminder — inject if model hasn't updated todos for 3 rounds\n        if rounds_since_todo >= 3 and messages:\n            messages.append({\"role\": \"user\",\n                             \"content\": \"<reminder>Update your todos.</reminder>\"})\n            rounds_since_todo = 0\n\n        response = client.messages.create(\n            model=MODEL, system=SYSTEM, messages=messages,\n            tools=TOOLS, max_tokens=8000,\n        )\n        messages.append({\"role\": \"assistant\", \"content\": response.content})\n\n        if response.stop_reason != \"tool_use\":\n            force = trigger_hooks(\"Stop\", messages)\n            if force:\n                messages.append({\"role\": \"user\", \"content\": force})\n                continue\n            return\n\n        rounds_since_todo += 1\n        results = []\n        for block in response.content:\n            if block.type != \"tool_use\":\n                continue\n\n            blocked = trigger_hooks(\"PreToolUse\", block)\n            if blocked:\n                results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                                \"content\": str(blocked)})\n                continue\n\n            handler = TOOL_HANDLERS.get(block.name)\n            output = handler(**block.input) if handler else f\"Unknown: {block.name}\"\n\n            trigger_hooks(\"PostToolUse\", block, output)\n\n            # s05: reset nag counter when todo_write is called\n            if block.name == \"todo_write\":\n                rounds_since_todo = 0\n\n            results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                            \"content\": output})\n\n        messages.append({\"role\": \"user\", \"content\": results})\n\n\nif __name__ == \"__main__\":\n    print(\"s05: TodoWrite — plan before execute, nag if you forget\")\n    print(\"Type a question, press Enter. Type q to quit.\\n\")\n\n    history = []\n    while True:\n        try:\n            query = input(\"\\033[36ms05 >> \\033[0m\")\n        except (EOFError, KeyboardInterrupt):\n            break\n        if query.strip().lower() in (\"q\", \"exit\", \"\"):\n            break\n        trigger_hooks(\"UserPromptSubmit\", query)\n        history.append({\"role\": \"user\", \"content\": query})\n        agent_loop(history)\n        for block in history[-1][\"content\"]:\n            if getattr(block, \"type\", None) == \"text\":\n                print(block.text)\n        print()\n",
+      "images": [
+        {
+          "src": "/course-assets/s05_todo_write/todo-overview.svg",
+          "alt": "todo overview"
+        }
+      ]
+    },
+    {
+      "id": "s06",
+      "filename": "s06_subagent/code.py",
+      "title": "Subagent",
+      "subtitle": "Break Large Tasks into Small Ones with Clean Context",
+      "loc": 304,
+      "tools": [
+        "bash",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "todo_write",
+        "task"
+      ],
+      "newTools": [
+        "task"
+      ],
+      "coreAddition": "Isolated subtask context",
+      "keyInsight": "Subagents give each subtask a clean message history while preserving the main thread.",
+      "classes": [],
+      "functions": [
+        {
+          "name": "safe_path",
+          "signature": "def safe_path(p: str)",
+          "startLine": 69
+        },
+        {
+          "name": "run_bash",
+          "signature": "def run_bash(command: str)",
+          "startLine": 75
+        },
+        {
+          "name": "run_read",
+          "signature": "def run_read(path: str, limit: int | None = None)",
+          "startLine": 84
+        },
+        {
+          "name": "run_write",
+          "signature": "def run_write(path: str, content: str)",
+          "startLine": 93
+        },
+        {
+          "name": "run_edit",
+          "signature": "def run_edit(path: str, old_text: str, new_text: str)",
+          "startLine": 102
+        },
+        {
+          "name": "run_glob",
+          "signature": "def run_glob(pattern: str)",
+          "startLine": 113
+        },
+        {
+          "name": "_normalize_todos",
+          "signature": "def _normalize_todos(todos)",
+          "startLine": 124
+        },
+        {
+          "name": "run_todo_write",
+          "signature": "def run_todo_write(todos: list)",
+          "startLine": 144
+        },
+        {
+          "name": "extract_text",
+          "signature": "def extract_text(content)",
+          "startLine": 201
+        },
+        {
+          "name": "spawn_subagent",
+          "signature": "def spawn_subagent(description: str)",
+          "startLine": 207
+        },
+        {
+          "name": "register_hook",
+          "signature": "def register_hook(event: str, callback)",
+          "startLine": 266
+        },
+        {
+          "name": "trigger_hooks",
+          "signature": "def trigger_hooks(event: str, *args)",
+          "startLine": 269
+        },
+        {
+          "name": "permission_hook",
+          "signature": "def permission_hook(block)",
+          "startLine": 278
+        },
+        {
+          "name": "log_hook",
+          "signature": "def log_hook(block)",
+          "startLine": 287
+        },
+        {
+          "name": "context_inject_hook",
+          "signature": "def context_inject_hook(query: str)",
+          "startLine": 292
+        },
+        {
+          "name": "summary_hook",
+          "signature": "def summary_hook(messages: list)",
+          "startLine": 297
+        },
+        {
+          "name": "agent_loop",
+          "signature": "def agent_loop(messages: list)",
+          "startLine": 317
+        }
+      ],
+      "layer": "planning",
+      "source": "#!/usr/bin/env python3\n\"\"\"\ns06: Subagent — spawn sub-agents with fresh messages[] for context isolation.\n\n  Parent Agent                           Subagent\n  +------------------+                  +------------------+\n  | messages=[...]   |                  | messages=[task]  | <-- fresh\n  |                  |   dispatch       |                  |\n  | tool: task       | ---------------> | own while loop   |\n  |   prompt=\"...\"   |                  |   bash/read/...  |\n  |                  |   summary only   |   (max 30 turns) |\n  | result = \"...\"   | <--------------- | return last text |\n  +------------------+                  +------------------+\n        ^                                      |\n        |       intermediate results DISCARDED  |\n        +--------------------------------------+\n\n  Subagent tools: bash, read, write, edit, glob (NO task — no recursion)\n\nChanges from s05:\n  + task tool + spawn_subagent() with fresh messages[]\n  + Safety limit: max 30 turns per subagent\n  + extract_text() helper\n  Subagent cannot spawn sub-subagents (no task tool in sub_tools).\n  Main loop unchanged: task auto-dispatches via TOOL_HANDLERS.\n\nRun: python s06_subagent/code.py\nNeeds: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env\n\"\"\"\n\nimport ast, json, os, subprocess\nfrom pathlib import Path\n\ntry:\n    import readline\n    readline.parse_and_bind('set bind-tty-special-chars off')\nexcept ImportError:\n    pass\n\nfrom anthropic import Anthropic\nfrom dotenv import load_dotenv\n\nload_dotenv(override=True)\nif os.getenv(\"ANTHROPIC_BASE_URL\"):\n    os.environ.pop(\"ANTHROPIC_AUTH_TOKEN\", None)\n\nWORKDIR = Path.cwd()\nclient = Anthropic(base_url=os.getenv(\"ANTHROPIC_BASE_URL\"))\nMODEL = os.environ[\"MODEL_ID\"]\nCURRENT_TODOS: list[dict] = []\n\nSYSTEM = (\n    f\"You are a coding agent at {WORKDIR}. \"\n    \"For complex sub-problems, use the task tool to spawn a subagent.\"\n)\n\n# s06: subagent gets its own system prompt — no task, no recursion\nSUB_SYSTEM = (\n    f\"You are a coding agent at {WORKDIR}. \"\n    \"Complete the task you were given, then return a concise summary. \"\n    \"Do not delegate further.\"\n)\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s02-s05 (unchanged): Tool Implementations\n# ═══════════════════════════════════════════════════════════\n\ndef safe_path(p: str) -> Path:\n    path = (WORKDIR / p).resolve()\n    if not path.is_relative_to(WORKDIR):\n        raise ValueError(f\"Path escapes workspace: {p}\")\n    return path\n\ndef run_bash(command: str) -> str:\n    try:\n        r = subprocess.run(command, shell=True, cwd=WORKDIR,\n                           capture_output=True, text=True, timeout=120)\n        out = (r.stdout + r.stderr).strip()\n        return out[:50000] if out else \"(no output)\"\n    except subprocess.TimeoutExpired:\n        return \"Error: Timeout (120s)\"\n\ndef run_read(path: str, limit: int | None = None) -> str:\n    try:\n        lines = safe_path(path).read_text().splitlines()\n        if limit and limit < len(lines):\n            lines = lines[:limit] + [f\"... ({len(lines) - limit} more lines)\"]\n        return \"\\n\".join(lines)\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_write(path: str, content: str) -> str:\n    try:\n        file_path = safe_path(path)\n        file_path.parent.mkdir(parents=True, exist_ok=True)\n        file_path.write_text(content)\n        return f\"Wrote {len(content)} bytes to {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_edit(path: str, old_text: str, new_text: str) -> str:\n    try:\n        file_path = safe_path(path)\n        text = file_path.read_text()\n        if old_text not in text:\n            return f\"Error: text not found in {path}\"\n        file_path.write_text(text.replace(old_text, new_text, 1))\n        return f\"Edited {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_glob(pattern: str) -> str:\n    import glob as g\n    try:\n        results = []\n        for match in g.glob(pattern, root_dir=WORKDIR):\n            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):\n                results.append(match)\n        return \"\\n\".join(results) if results else \"(no matches)\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef _normalize_todos(todos):\n    if isinstance(todos, str):\n        try:\n            todos = json.loads(todos)\n        except json.JSONDecodeError:\n            try:\n                todos = ast.literal_eval(todos)\n            except (SyntaxError, ValueError):\n                return None, \"Error: todos must be a list or JSON array string\"\n    if not isinstance(todos, list):\n        return None, \"Error: todos must be a list\"\n    for i, t in enumerate(todos):\n        if not isinstance(t, dict):\n            return None, f\"Error: todos[{i}] must be an object\"\n        if \"content\" not in t or \"status\" not in t:\n            return None, f\"Error: todos[{i}] missing 'content' or 'status'\"\n        if t[\"status\"] not in (\"pending\", \"in_progress\", \"completed\"):\n            return None, f\"Error: todos[{i}] has invalid status '{t['status']}'\"\n    return todos, None\n\ndef run_todo_write(todos: list) -> str:\n    global CURRENT_TODOS\n    todos, error = _normalize_todos(todos)\n    if error:\n        return error\n    CURRENT_TODOS = todos\n    lines = [\"\\n\\033[33m## Current Tasks\\033[0m\"]\n    for t in CURRENT_TODOS:\n        icon = {\"pending\": \" \", \"in_progress\": \"\\033[36m▸\\033[0m\", \"completed\": \"\\033[32m✓\\033[0m\"}[t[\"status\"]]\n        lines.append(f\"  [{icon}] {t['content']}\")\n    print(\"\\n\".join(lines))\n    return f\"Updated {len(CURRENT_TODOS)} tasks\"\n\nTOOLS = [\n    {\"name\": \"bash\", \"description\": \"Run a shell command.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}},\n    {\"name\": \"read_file\", \"description\": \"Read file contents.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}},\n    {\"name\": \"write_file\", \"description\": \"Write content to a file.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}},\n    {\"name\": \"edit_file\", \"description\": \"Replace exact text in a file once.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_text\": {\"type\": \"string\"}, \"new_text\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old_text\", \"new_text\"]}},\n    {\"name\": \"glob\", \"description\": \"Find files matching a glob pattern.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}},\n    {\"name\": \"todo_write\", \"description\": \"Create and manage a task list for your current coding session.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"todos\": {\"type\": \"array\", \"items\": {\"type\": \"object\", \"properties\": {\"content\": {\"type\": \"string\"}, \"status\": {\"type\": \"string\", \"enum\": [\"pending\", \"in_progress\", \"completed\"]}}, \"required\": [\"content\", \"status\"]}}}, \"required\": [\"todos\"]}},\n]\n\nTOOL_HANDLERS = {\n    \"bash\": run_bash, \"read_file\": run_read, \"write_file\": run_write,\n    \"edit_file\": run_edit, \"glob\": run_glob, \"todo_write\": run_todo_write,\n}\n\n\n# ═══════════════════════════════════════════════════════════\n#  NEW in s06: Subagent — fresh messages[], summary only\n# ═══════════════════════════════════════════════════════════\n\nSUB_TOOLS = [\n    {\"name\": \"bash\", \"description\": \"Run a shell command.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}},\n    {\"name\": \"read_file\", \"description\": \"Read file contents.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}},\n    {\"name\": \"write_file\", \"description\": \"Write content to a file.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}},\n    {\"name\": \"edit_file\", \"description\": \"Replace exact text in a file once.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_text\": {\"type\": \"string\"}, \"new_text\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old_text\", \"new_text\"]}},\n    {\"name\": \"glob\", \"description\": \"Find files matching a glob pattern.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}},\n]\n# NO \"task\" tool — prevent recursive spawning\n\nSUB_HANDLERS = {\n    \"bash\": run_bash, \"read_file\": run_read, \"write_file\": run_write,\n    \"edit_file\": run_edit, \"glob\": run_glob,\n}\n\ndef extract_text(content) -> str:\n    \"\"\"Extract text from message content blocks.\"\"\"\n    if not isinstance(content, list):\n        return str(content)\n    return \"\\n\".join(getattr(b, \"text\", \"\") for b in content if getattr(b, \"type\", None) == \"text\")\n\ndef spawn_subagent(description: str) -> str:\n    \"\"\"Spawn a subagent with fresh messages[], return summary only.\"\"\"\n    print(f\"\\n\\033[35m[Subagent spawned]\\033[0m\")\n    messages = [{\"role\": \"user\", \"content\": description}]  # fresh context\n\n    for _ in range(30):  # safety limit\n        response = client.messages.create(\n            model=MODEL, system=SUB_SYSTEM,\n            messages=messages, tools=SUB_TOOLS, max_tokens=8000,\n        )\n        messages.append({\"role\": \"assistant\", \"content\": response.content})\n        if response.stop_reason != \"tool_use\":\n            break\n        results = []\n        for block in response.content:\n            if block.type == \"tool_use\":\n                # Issue 1: subagent also runs hooks (permissions apply)\n                blocked = trigger_hooks(\"PreToolUse\", block)\n                if blocked:\n                    results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                                    \"content\": str(blocked)})\n                    continue\n                handler = SUB_HANDLERS.get(block.name)\n                output = handler(**block.input) if handler else f\"Unknown: {block.name}\"\n                trigger_hooks(\"PostToolUse\", block, output)\n                print(f\"  \\033[90m[sub] {block.name}: {str(output)[:100]}\\033[0m\")\n                results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                                \"content\": output})\n        messages.append({\"role\": \"user\", \"content\": results})\n\n    # Issue 5: fallback if safety limit hit during tool_use\n    result = extract_text(messages[-1][\"content\"])\n    if not result:\n        # last message is tool_result, look backwards for assistant text\n        for msg in reversed(messages):\n            if msg[\"role\"] == \"assistant\":\n                result = extract_text(msg[\"content\"])\n                if result:\n                    break\n        if not result:\n            result = \"Subagent stopped after 30 turns without final answer.\"\n    print(f\"\\033[35m[Subagent done]\\033[0m\")\n    return result  # only summary, entire message history discarded\n\n# Add task tool to parent's tools\nTOOLS.append({\n    \"name\": \"task\",\n    \"description\": \"Launch a subagent to handle a complex subtask. Returns only the final conclusion.\",\n    \"input_schema\": {\"type\": \"object\", \"properties\": {\"description\": {\"type\": \"string\"}}, \"required\": [\"description\"]},\n})\nTOOL_HANDLERS[\"task\"] = spawn_subagent\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s04 (unchanged): Hook System\n# ═══════════════════════════════════════════════════════════\n\nHOOKS = {\"UserPromptSubmit\": [], \"PreToolUse\": [], \"PostToolUse\": [], \"Stop\": []}\n\ndef register_hook(event: str, callback):\n    HOOKS[event].append(callback)\n\ndef trigger_hooks(event: str, *args):\n    for callback in HOOKS[event]:\n        result = callback(*args)\n        if result is not None:\n            return result\n    return None\n\nDENY_LIST = [\"rm -rf /\", \"sudo\", \"shutdown\", \"reboot\", \"mkfs\", \"dd if=\"]\n\ndef permission_hook(block):\n    \"\"\"PreToolUse: deny list check.\"\"\"\n    if block.name == \"bash\":\n        for p in DENY_LIST:\n            if p in block.input.get(\"command\", \"\"):\n                print(f\"\\n\\033[31m⛔ Blocked: '{p}'\\033[0m\")\n                return \"Permission denied\"\n    return None\n\ndef log_hook(block):\n    \"\"\"PreToolUse: log tool calls.\"\"\"\n    print(f\"\\033[90m[HOOK] {block.name}\\033[0m\")\n    return None\n\ndef context_inject_hook(query: str):\n    \"\"\"UserPromptSubmit: log working directory.\"\"\"\n    print(f\"\\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\\033[0m\")\n    return None\n\ndef summary_hook(messages: list):\n    \"\"\"Stop: print tool call count.\"\"\"\n    tool_count = sum(1 for m in messages\n                     for b in (m.get(\"content\") if isinstance(m.get(\"content\"), list) else [])\n                     if isinstance(b, dict) and b.get(\"type\") == \"tool_result\")\n    print(f\"\\033[90m[HOOK] Stop: session used {tool_count} tool calls\\033[0m\")\n    return None\n\nregister_hook(\"UserPromptSubmit\", context_inject_hook)\nregister_hook(\"PreToolUse\", permission_hook)\nregister_hook(\"PreToolUse\", log_hook)\nregister_hook(\"Stop\", summary_hook)\n\n\n# ═══════════════════════════════════════════════════════════\n#  agent_loop — same as s05 + nag reminder, task auto-dispatches\n# ═══════════════════════════════════════════════════════════\n\nrounds_since_todo = 0\n\ndef agent_loop(messages: list):\n    global rounds_since_todo\n    while True:\n        # s05: nag reminder\n        if rounds_since_todo >= 3 and messages:\n            messages.append({\"role\": \"user\",\n                             \"content\": \"<reminder>Update your todos.</reminder>\"})\n            rounds_since_todo = 0\n\n        response = client.messages.create(\n            model=MODEL, system=SYSTEM, messages=messages,\n            tools=TOOLS, max_tokens=8000,\n        )\n        messages.append({\"role\": \"assistant\", \"content\": response.content})\n\n        if response.stop_reason != \"tool_use\":\n            force = trigger_hooks(\"Stop\", messages)\n            if force:\n                messages.append({\"role\": \"user\", \"content\": force})\n                continue\n            return\n\n        rounds_since_todo += 1\n        results = []\n        for block in response.content:\n            if block.type != \"tool_use\":\n                continue\n\n            blocked = trigger_hooks(\"PreToolUse\", block)\n            if blocked:\n                results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                                \"content\": str(blocked)})\n                continue\n\n            handler = TOOL_HANDLERS.get(block.name)\n            output = handler(**block.input) if handler else f\"Unknown: {block.name}\"\n\n            trigger_hooks(\"PostToolUse\", block, output)\n\n            if block.name == \"todo_write\":\n                rounds_since_todo = 0\n\n            results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                            \"content\": output})\n\n        messages.append({\"role\": \"user\", \"content\": results})\n\n\nif __name__ == \"__main__\":\n    print(\"s06: Subagent — spawn sub-agents with fresh context, summary only\")\n    print(\"Type a question, press Enter. Type q to quit.\\n\")\n\n    history = []\n    while True:\n        try:\n            query = input(\"\\033[36ms06 >> \\033[0m\")\n        except (EOFError, KeyboardInterrupt):\n            break\n        if query.strip().lower() in (\"q\", \"exit\", \"\"):\n            break\n        trigger_hooks(\"UserPromptSubmit\", query)\n        history.append({\"role\": \"user\", \"content\": query})\n        agent_loop(history)\n        for block in history[-1][\"content\"]:\n            if getattr(block, \"type\", None) == \"text\":\n                print(block.text)\n        print()\n",
+      "images": [
+        {
+          "src": "/course-assets/s06_subagent/subagent-overview.svg",
+          "alt": "subagent overview"
+        }
+      ]
+    },
+    {
+      "id": "s07",
+      "filename": "s07_skill_loading/code.py",
+      "title": "Skill Loading",
+      "subtitle": "Load Only When Needed",
+      "loc": 335,
+      "tools": [
+        "bash",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "todo_write",
+        "task",
+        "load_skill"
+      ],
+      "newTools": [
+        "load_skill"
+      ],
+      "coreAddition": "On-demand skill loader",
+      "keyInsight": "Inject specialized knowledge only when the task actually needs it.",
+      "classes": [],
+      "functions": [
+        {
+          "name": "_parse_frontmatter",
+          "signature": "def _parse_frontmatter(text: str)",
+          "startLine": 53
+        },
+        {
+          "name": "_scan_skills",
+          "signature": "def _scan_skills()",
+          "startLine": 69
+        },
+        {
+          "name": "list_skills",
+          "signature": "def list_skills()",
+          "startLine": 86
+        },
+        {
+          "name": "build_system",
+          "signature": "def build_system()",
+          "startLine": 93
+        },
+        {
+          "name": "safe_path",
+          "signature": "def safe_path(p: str)",
+          "startLine": 116
+        },
+        {
+          "name": "run_bash",
+          "signature": "def run_bash(command: str)",
+          "startLine": 122
+        },
+        {
+          "name": "run_read",
+          "signature": "def run_read(path: str, limit: int | None = None)",
+          "startLine": 131
+        },
+        {
+          "name": "run_write",
+          "signature": "def run_write(path: str, content: str)",
+          "startLine": 140
+        },
+        {
+          "name": "run_edit",
+          "signature": "def run_edit(path: str, old_text: str, new_text: str)",
+          "startLine": 149
+        },
+        {
+          "name": "run_glob",
+          "signature": "def run_glob(pattern: str)",
+          "startLine": 160
+        },
+        {
+          "name": "_normalize_todos",
+          "signature": "def _normalize_todos(todos)",
+          "startLine": 171
+        },
+        {
+          "name": "run_todo_write",
+          "signature": "def run_todo_write(todos: list)",
+          "startLine": 191
+        },
+        {
+          "name": "extract_text",
+          "signature": "def extract_text(content)",
+          "startLine": 204
+        },
+        {
+          "name": "spawn_subagent",
+          "signature": "def spawn_subagent(description: str)",
+          "startLine": 229
+        },
+        {
+          "name": "load_skill",
+          "signature": "def load_skill(name: str)",
+          "startLine": 269
+        },
+        {
+          "name": "register_hook",
+          "signature": "def register_hook(event: str, callback)",
+          "startLine": 314
+        },
+        {
+          "name": "trigger_hooks",
+          "signature": "def trigger_hooks(event: str, *args)",
+          "startLine": 317
+        },
+        {
+          "name": "permission_hook",
+          "signature": "def permission_hook(block)",
+          "startLine": 326
+        },
+        {
+          "name": "log_hook",
+          "signature": "def log_hook(block)",
+          "startLine": 334
+        },
+        {
+          "name": "context_inject_hook",
+          "signature": "def context_inject_hook(query: str)",
+          "startLine": 338
+        },
+        {
+          "name": "summary_hook",
+          "signature": "def summary_hook(messages: list)",
+          "startLine": 342
+        },
+        {
+          "name": "agent_loop",
+          "signature": "def agent_loop(messages: list)",
+          "startLine": 361
+        }
+      ],
+      "layer": "planning",
+      "source": "#!/usr/bin/env python3\n\"\"\"\ns07: Skill Loading — two-level on-demand knowledge injection.\n\n  Layer 1 (cheap, always present):\n    SYSTEM prompt includes skill names + one-line descriptions (~100 tokens/skill)\n    \"Skills available: agent-builder, code-review, mcp-builder, pdf\"\n\n  Layer 2 (expensive, on demand):\n    Agent calls load_skill(\"code-review\") → full SKILL.md content\n    injected via tool_result (~2000 tokens/skill)\n\n  skills/\n    agent-builder/SKILL.md\n    code-review/SKILL.md\n    mcp-builder/SKILL.md\n    pdf/SKILL.md\n\nChanges from s06:\n  + build_system() — scan skills/ dir at startup, inject catalog into SYSTEM\n  + load_skill(name) — return full SKILL.md content via tool_result\n  + SKILLS_DIR config\n  Loop unchanged: load_skill auto-dispatches via TOOL_HANDLERS.\n\nRun: python s07_skill_loading/code.py\nNeeds: pip install anthropic python-dotenv pyyaml + ANTHROPIC_API_KEY in .env\n\"\"\"\n\nimport ast, json, os, subprocess\nfrom pathlib import Path\nimport yaml\n\ntry:\n    import readline\n    readline.parse_and_bind('set bind-tty-special-chars off')\nexcept ImportError:\n    pass\n\nfrom anthropic import Anthropic\nfrom dotenv import load_dotenv\n\nload_dotenv(override=True)\nif os.getenv(\"ANTHROPIC_BASE_URL\"):\n    os.environ.pop(\"ANTHROPIC_AUTH_TOKEN\", None)\n\nWORKDIR = Path.cwd()\nSKILLS_DIR = WORKDIR / \"skills\"\nclient = Anthropic(base_url=os.getenv(\"ANTHROPIC_BASE_URL\"))\nMODEL = os.environ[\"MODEL_ID\"]\nCURRENT_TODOS: list[dict] = []\n\n# s07: Skill catalog scan (used by build_system below)\ndef _parse_frontmatter(text: str) -> tuple[dict, str]:\n    \"\"\"Parse YAML frontmatter from SKILL.md. Returns (meta, body).\"\"\"\n    if not text.startswith(\"---\"):\n        return {}, text\n    parts = text.split(\"---\", 2)\n    if len(parts) < 3:\n        return {}, text\n    try:\n        meta = yaml.safe_load(parts[1]) or {}\n    except yaml.YAMLError:\n        meta = {}\n    return meta, parts[2].strip()\n\n# Build skill registry at startup (used for safe lookup in load_skill)\nSKILL_REGISTRY: dict[str, dict] = {}\n\ndef _scan_skills():\n    \"\"\"Scan skills/ dir, populate SKILL_REGISTRY with name/description/content.\"\"\"\n    if not SKILLS_DIR.exists():\n        return\n    for d in sorted(SKILLS_DIR.iterdir()):\n        if not d.is_dir():\n            continue\n        manifest = d / \"SKILL.md\"\n        if manifest.exists():\n            raw = manifest.read_text()\n            meta, body = _parse_frontmatter(raw)\n            name = meta.get(\"name\", d.name)\n            desc = meta.get(\"description\", raw.split(\"\\n\")[0].lstrip(\"#\").strip())\n            SKILL_REGISTRY[name] = {\"name\": name, \"description\": desc, \"content\": raw}\n\n_scan_skills()\n\ndef list_skills() -> str:\n    \"\"\"List all skills (name + one-line description).\"\"\"\n    if not SKILL_REGISTRY:\n        return \"(no skills found)\"\n    return \"\\n\".join(f\"- **{s['name']}**: {s['description']}\" for s in SKILL_REGISTRY.values())\n\n# s07: SYSTEM includes skill catalog (cheap — just names + descriptions)\ndef build_system() -> str:\n    \"\"\"Build SYSTEM prompt with skill catalog injected at startup.\"\"\"\n    catalog = list_skills()\n    return (\n        f\"You are a coding agent at {WORKDIR}. \"\n        f\"Skills available:\\n{catalog}\\n\"\n        \"Use load_skill to get full details when needed.\"\n    )\n\nSYSTEM = build_system()\n\n# s07: subagent gets its own system prompt — no skill loading, no task\nSUB_SYSTEM = (\n    f\"You are a coding agent at {WORKDIR}. \"\n    \"Complete the task you were given, then return a concise summary. \"\n    \"Do not delegate further.\"\n)\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s02-s06 (unchanged): Tool Implementations\n# ═══════════════════════════════════════════════════════════\n\ndef safe_path(p: str) -> Path:\n    path = (WORKDIR / p).resolve()\n    if not path.is_relative_to(WORKDIR):\n        raise ValueError(f\"Path escapes workspace: {p}\")\n    return path\n\ndef run_bash(command: str) -> str:\n    try:\n        r = subprocess.run(command, shell=True, cwd=WORKDIR,\n                           capture_output=True, text=True, timeout=120)\n        out = (r.stdout + r.stderr).strip()\n        return out[:50000] if out else \"(no output)\"\n    except subprocess.TimeoutExpired:\n        return \"Error: Timeout (120s)\"\n\ndef run_read(path: str, limit: int | None = None) -> str:\n    try:\n        lines = safe_path(path).read_text().splitlines()\n        if limit and limit < len(lines):\n            lines = lines[:limit] + [f\"... ({len(lines) - limit} more lines)\"]\n        return \"\\n\".join(lines)\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_write(path: str, content: str) -> str:\n    try:\n        file_path = safe_path(path)\n        file_path.parent.mkdir(parents=True, exist_ok=True)\n        file_path.write_text(content)\n        return f\"Wrote {len(content)} bytes to {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_edit(path: str, old_text: str, new_text: str) -> str:\n    try:\n        file_path = safe_path(path)\n        text = file_path.read_text()\n        if old_text not in text:\n            return f\"Error: text not found in {path}\"\n        file_path.write_text(text.replace(old_text, new_text, 1))\n        return f\"Edited {path}\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef run_glob(pattern: str) -> str:\n    import glob as g\n    try:\n        results = []\n        for match in g.glob(pattern, root_dir=WORKDIR):\n            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):\n                results.append(match)\n        return \"\\n\".join(results) if results else \"(no matches)\"\n    except Exception as e:\n        return f\"Error: {e}\"\n\ndef _normalize_todos(todos):\n    if isinstance(todos, str):\n        try:\n            todos = json.loads(todos)\n        except json.JSONDecodeError:\n            try:\n                todos = ast.literal_eval(todos)\n            except (SyntaxError, ValueError):\n                return None, \"Error: todos must be a list or JSON array string\"\n    if not isinstance(todos, list):\n        return None, \"Error: todos must be a list\"\n    for i, t in enumerate(todos):\n        if not isinstance(t, dict):\n            return None, f\"Error: todos[{i}] must be an object\"\n        if \"content\" not in t or \"status\" not in t:\n            return None, f\"Error: todos[{i}] missing 'content' or 'status'\"\n        if t[\"status\"] not in (\"pending\", \"in_progress\", \"completed\"):\n            return None, f\"Error: todos[{i}] has invalid status '{t['status']}'\"\n    return todos, None\n\ndef run_todo_write(todos: list) -> str:\n    global CURRENT_TODOS\n    todos, error = _normalize_todos(todos)\n    if error:\n        return error\n    CURRENT_TODOS = todos\n    lines = [\"\\n\\033[33m## Current Tasks\\033[0m\"]\n    for t in CURRENT_TODOS:\n        icon = {\"pending\": \" \", \"in_progress\": \"\\033[36m▸\\033[0m\", \"completed\": \"\\033[32m✓\\033[0m\"}[t[\"status\"]]\n        lines.append(f\"  [{icon}] {t['content']}\")\n    print(\"\\n\".join(lines))\n    return f\"Updated {len(CURRENT_TODOS)} tasks\"\n\ndef extract_text(content) -> str:\n    if not isinstance(content, list):\n        return str(content)\n    return \"\\n\".join(getattr(b, \"text\", \"\") for b in content if getattr(b, \"type\", None) == \"text\")\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s06 (unchanged): Subagent\n# ═══════════════════════════════════════════════════════════\n\nSUB_TOOLS = [\n    {\"name\": \"bash\", \"description\": \"Run a shell command.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}},\n    {\"name\": \"read_file\", \"description\": \"Read file contents.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}},\n    {\"name\": \"write_file\", \"description\": \"Write content to a file.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}},\n    {\"name\": \"edit_file\", \"description\": \"Replace exact text in a file once.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_text\": {\"type\": \"string\"}, \"new_text\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old_text\", \"new_text\"]}},\n    {\"name\": \"glob\", \"description\": \"Find files matching a glob pattern.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}},\n]\nSUB_HANDLERS = {\"bash\": run_bash, \"read_file\": run_read, \"write_file\": run_write,\n                \"edit_file\": run_edit, \"glob\": run_glob}\n\ndef spawn_subagent(description: str) -> str:\n    print(f\"\\n\\033[35m[Subagent spawned]\\033[0m\")\n    messages = [{\"role\": \"user\", \"content\": description}]\n    for _ in range(30):\n        response = client.messages.create(model=MODEL, system=SUB_SYSTEM,\n            messages=messages, tools=SUB_TOOLS, max_tokens=8000)\n        messages.append({\"role\": \"assistant\", \"content\": response.content})\n        if response.stop_reason != \"tool_use\":\n            break\n        results = []\n        for block in response.content:\n            if block.type == \"tool_use\":\n                blocked = trigger_hooks(\"PreToolUse\", block)\n                if blocked:\n                    results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                                    \"content\": str(blocked)})\n                    continue\n                handler = SUB_HANDLERS.get(block.name)\n                output = handler(**block.input) if handler else f\"Unknown: {block.name}\"\n                trigger_hooks(\"PostToolUse\", block, output)\n                print(f\"  \\033[90m[sub] {block.name}: {str(output)[:100]}\\033[0m\")\n                results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id, \"content\": output})\n        messages.append({\"role\": \"user\", \"content\": results})\n    result = extract_text(messages[-1][\"content\"])\n    if not result:\n        for msg in reversed(messages):\n            if msg[\"role\"] == \"assistant\":\n                result = extract_text(msg[\"content\"])\n                if result:\n                    break\n        if not result:\n            result = \"Subagent stopped after 30 turns without final answer.\"\n    print(f\"\\033[35m[Subagent done]\\033[0m\")\n    return result\n\n\n# ═══════════════════════════════════════════════════════════\n#  NEW in s07: load_skill — runtime full content loading\n# ═══════════════════════════════════════════════════════════\n\ndef load_skill(name: str) -> str:\n    \"\"\"Load full skill content. Lookup via registry — no path traversal.\"\"\"\n    skill = SKILL_REGISTRY.get(name)\n    if not skill:\n        return f\"Skill not found: {name}\"\n    return skill[\"content\"]\n\n\n# ═══════════════════════════════════════════════════════════\n#  Tool Registry — all tools from s02-s07\n# ═══════════════════════════════════════════════════════════\n\nTOOLS = [\n    {\"name\": \"bash\", \"description\": \"Run a shell command.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}},\n    {\"name\": \"read_file\", \"description\": \"Read file contents.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}},\n    {\"name\": \"write_file\", \"description\": \"Write content to a file.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}},\n    {\"name\": \"edit_file\", \"description\": \"Replace exact text in a file once.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_text\": {\"type\": \"string\"}, \"new_text\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old_text\", \"new_text\"]}},\n    {\"name\": \"glob\", \"description\": \"Find files matching a glob pattern.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}}, \"required\": [\"pattern\"]}},\n    {\"name\": \"todo_write\", \"description\": \"Create and manage a task list for your current coding session.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"todos\": {\"type\": \"array\", \"items\": {\"type\": \"object\", \"properties\": {\"content\": {\"type\": \"string\"}, \"status\": {\"type\": \"string\", \"enum\": [\"pending\", \"in_progress\", \"completed\"]}}, \"required\": [\"content\", \"status\"]}}}, \"required\": [\"todos\"]}},\n    {\"name\": \"task\", \"description\": \"Launch a subagent to handle a complex subtask. Returns only the final conclusion.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"description\": {\"type\": \"string\"}}, \"required\": [\"description\"]}},\n    # s07: skill tool (catalog is already in SYSTEM prompt, this loads full content)\n    {\"name\": \"load_skill\", \"description\": \"Load the full content of a skill by name.\",\n     \"input_schema\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}}, \"required\": [\"name\"]}},\n]\n\nTOOL_HANDLERS = {\n    \"bash\": run_bash, \"read_file\": run_read, \"write_file\": run_write,\n    \"edit_file\": run_edit, \"glob\": run_glob, \"todo_write\": run_todo_write,\n    \"task\": spawn_subagent, \"load_skill\": load_skill,\n}\n\n\n# ═══════════════════════════════════════════════════════════\n#  FROM s04 (unchanged): Hook System\n# ═══════════════════════════════════════════════════════════\n\nHOOKS = {\"UserPromptSubmit\": [], \"PreToolUse\": [], \"PostToolUse\": [], \"Stop\": []}\n\ndef register_hook(event: str, callback):\n    HOOKS[event].append(callback)\n\ndef trigger_hooks(event: str, *args):\n    for callback in HOOKS[event]:\n        result = callback(*args)\n        if result is not None:\n            return result\n    return None\n\nDENY_LIST = [\"rm -rf /\", \"sudo\", \"shutdown\", \"reboot\", \"mkfs\", \"dd if=\"]\n\ndef permission_hook(block):\n    if block.name == \"bash\":\n        for p in DENY_LIST:\n            if p in block.input.get(\"command\", \"\"):\n                print(f\"\\n\\033[31m⛔ Blocked: '{p}'\\033[0m\")\n                return \"Permission denied\"\n    return None\n\ndef log_hook(block):\n    print(f\"\\033[90m[HOOK] {block.name}\\033[0m\")\n    return None\n\ndef context_inject_hook(query: str):\n    print(f\"\\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\\033[0m\")\n    return None\n\ndef summary_hook(messages: list):\n    tool_count = sum(1 for m in messages\n                     for b in (m.get(\"content\") if isinstance(m.get(\"content\"), list) else [])\n                     if isinstance(b, dict) and b.get(\"type\") == \"tool_result\")\n    print(f\"\\033[90m[HOOK] Stop: session used {tool_count} tool calls\\033[0m\")\n    return None\n\nregister_hook(\"UserPromptSubmit\", context_inject_hook)\nregister_hook(\"PreToolUse\", permission_hook)\nregister_hook(\"PreToolUse\", log_hook)\nregister_hook(\"Stop\", summary_hook)\n\n\n# ═══════════════════════════════════════════════════════════\n#  agent_loop — same as s05-s06 + nag reminder\n# ═══════════════════════════════════════════════════════════\n\nrounds_since_todo = 0\n\ndef agent_loop(messages: list):\n    global rounds_since_todo\n    while True:\n        if rounds_since_todo >= 3 and messages:\n            messages.append({\"role\": \"user\",\n                             \"content\": \"<reminder>Update your todos.</reminder>\"})\n            rounds_since_todo = 0\n            \n        response = client.messages.create(\n            model=MODEL, system=SYSTEM, messages=messages,\n            tools=TOOLS, max_tokens=8000,\n        )\n        messages.append({\"role\": \"assistant\", \"content\": response.content})\n\n        if response.stop_reason != \"tool_use\":\n            force = trigger_hooks(\"Stop\", messages)\n            if force:\n                messages.append({\"role\": \"user\", \"content\": force})\n                continue\n            return\n\n        rounds_since_todo += 1\n        results = []\n        for block in response.content:\n            if block.type != \"tool_use\":\n                continue\n\n            blocked = trigger_hooks(\"PreToolUse\", block)\n            if blocked:\n                results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                                \"content\": str(blocked)})\n                continue\n\n            handler = TOOL_HANDLERS.get(block.name)\n            output = handler(**block.input) if handler else f\"Unknown: {block.name}\"\n\n            trigger_hooks(\"PostToolUse\", block, output)\n\n            if block.name == \"todo_write\":\n                rounds_since_todo = 0\n\n            results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id,\n                            \"content\": output})\n\n        messages.append({\"role\": \"user\", \"content\": results})\n\n\nif __name__ == \"__main__\":\n    print(\"s07: Skill Loading — catalog in SYSTEM, content on demand\")\n    print(\"Type a question, press Enter. Type q to quit.\\n\")\n\n    history = []\n    while True:\n        try:\n            query = input(\"\\033[36ms07 >> \\033[0m\")\n        except (EOFError, KeyboardInterrupt):\n            break\n        if query.strip().lower() in (\"q\", \"exit\", \"\"):\n            break\n        trigger_hooks(\"UserPromptSubmit\", query)\n        history.append({\"role\": \"user\", \"content\": query})\n        agent_loop(history)\n        for block in history[-1][\"content\"]:\n            if getattr(block, \"type\", None) == \"text\":\n                print(block.text)\n        print()\n",
+      "images": [
+        {
+          "src": "/course-assets/s07_skill_loading/skill-overview.svg",
+          "alt": "skill overview"
+        }
+      ]
+    },
+    {
+      "id": "s08",
+      "filename": "s08_context_compact/code.py",
+      "title": "Context Compact",
+      "subtitle": "Context Will Fill Up",
+      "loc": 382,
+      "tools": [
+        "bash",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "todo_write",
+        "task",
+        "load_skill",
         "compact"
       ],
       "newTools": [
         "compact"
       ],
-      "coreAddition": "micro-compact + auto-compact + archival",
-      "keyInsight": "Context will fill up; three-layer compression strategy enables infinite sessions",
+      "coreAddition": "Context compaction",
+      "keyInsight": "Compression keeps the conversation usable when the context window gets crowded.",
       "classes": [],
       "functions": [
         {
@@ -837,33 +1311,42 @@
         "safe_path",
         "run_read",
         "run_write",
-        "run_edit"
+        "run_edit",
+        "run_glob"
       ],
       "newTools": [
         "read_file",
         "write_file",
-        "edit_file"
+        "edit_file",
+        "glob"
       ],
       "locDelta": 26
     },
     {
       "from": "s02",
       "to": "s03",
-      "newClasses": [
-        "TodoManager"
+      "newClasses": [],
+      "newFunctions": [
+        "check_deny_list",
+        "check_rules",
+        "ask_user",
+        "check_permission"
       ],
-      "newFunctions": [],
-      "newTools": [
-        "todo"
-      ],
-      "locDelta": 56
+      "newTools": [],
+      "locDelta": 45
     },
     {
       "from": "s03",
       "to": "s04",
       "newClasses": [],
       "newFunctions": [
-        "run_subagent"
+        "register_hook",
+        "trigger_hooks",
+        "permission_hook",
+        "log_hook",
+        "large_output_hook",
+        "context_inject_hook",
+        "summary_hook"
       ],
       "newTools": [
         "task"
@@ -873,12 +1356,13 @@
     {
       "from": "s04",
       "to": "s05",
-      "newClasses": [
-        "SkillLoader"
+      "newClasses": [],
+      "newFunctions": [
+        "_normalize_todos",
+        "run_todo_write"
       ],
-      "newFunctions": [],
       "newTools": [
-        "load_skill"
+        "todo_write"
       ],
       "locDelta": 35
     },
@@ -887,56 +1371,66 @@
       "to": "s06",
       "newClasses": [],
       "newFunctions": [
-        "estimate_tokens",
-        "micro_compact",
-        "auto_compact"
+        "extract_text",
+        "spawn_subagent"
       ],
       "newTools": [
-        "compact"
+        "task"
       ],
       "locDelta": 34
     },
     {
       "from": "s06",
       "to": "s07",
-      "newClasses": [
-        "TaskManager"
+      "newClasses": [],
+      "newFunctions": [
+        "_parse_frontmatter",
+        "_scan_skills",
+        "list_skills",
+        "build_system",
+        "load_skill"
       ],
-      "newFunctions": [],
       "newTools": [
-        "task_create",
-        "task_update",
-        "task_list",
-        "task_get"
+        "load_skill"
       ],
       "locDelta": -10
     },
     {
       "from": "s07",
       "to": "s08",
-      "newClasses": [
-        "BackgroundManager"
+      "newClasses": [],
+      "newFunctions": [
+        "estimate_size",
+        "snip_compact",
+        "collect_tool_results",
+        "micro_compact",
+        "persist_large_output",
+        "tool_result_budget",
+        "write_transcript",
+        "summarize_history",
+        "compact_history",
+        "reactive_compact"
       ],
-      "newFunctions": [],
       "newTools": [
-        "background_run",
-        "check_background"
+        "compact"
       ],
       "locDelta": -12
     },
     {
       "from": "s08",
       "to": "s09",
-      "newClasses": [
-        "MessageBus",
-        "TeammateManager"
-      ],
+      "newClasses": [],
       "newFunctions": [
-        "_safe_path",
-        "_run_bash",
-        "_run_read",
-        "_run_write",
-        "_run_edit"
+        "write_memory_file",
+        "_rebuild_index",
+        "read_memory_index",
+        "read_memory_file",
+        "list_memory_files",
+        "select_relevant_memories",
+        "load_memories",
+        "extract_memories",
+        "consolidate_memories",
+        "persist_large"
       ],
       "newTools": [
         "alice",
@@ -953,25 +1447,24 @@
       "to": "s10",
       "newClasses": [],
       "newFunctions": [
-        "handle_shutdown_request",
-        "handle_plan_review",
-        "_check_shutdown_status"
+        "assemble_system_prompt",
+        "get_system_prompt",
+        "update_context"
       ],
-      "newTools": [
-        "shutdown_response",
-        "plan_approval",
-        "shutdown_request"
-      ],
-      "locDelta": 71
+      "newTools": [],
+      "locDelta": -332
     },
     {
       "from": "s10",
       "to": "s11",
-      "newClasses": [],
+      "newClasses": [
+        "RecoveryState"
+      ],
       "newFunctions": [
-        "scan_unclaimed_tasks",
-        "claim_task",
-        "make_identity_block"
+        "retry_delay",
+        "with_retry",
+        "is_prompt_too_long_error",
+        "reactive_compact"
       ],
       "newTools": [
         "idle",
@@ -983,31 +1476,28 @@
       "from": "s11",
       "to": "s12",
       "newClasses": [
-        "EventBus",
-        "TaskManager",
-        "WorktreeManager"
+        "Task"
       ],
       "newFunctions": [
-        "detect_repo_root",
-        "safe_path",
-        "run_bash",
-        "run_read",
-        "run_write",
-        "run_edit"
+        "_task_path",
+        "save_task",
+        "load_task",
+        "list_tasks",
+        "get_task",
+        "can_start",
+        "claim_task",
+        "complete_task",
+        "run_list_tasks",
+        "run_get_task",
+        "run_claim_task",
+        "run_complete_task"
       ],
       "newTools": [
-        "task_create",
-        "task_list",
-        "task_get",
-        "task_update",
-        "task_bind_worktree",
-        "worktree_create",
-        "worktree_list",
-        "worktree_status",
-        "worktree_run",
-        "worktree_remove",
-        "worktree_keep",
-        "worktree_events"
+        "create_task",
+        "list_tasks",
+        "get_task",
+        "claim_task",
+        "complete_task"
       ],
       "locDelta": 199
     }
